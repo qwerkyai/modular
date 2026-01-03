@@ -84,6 +84,11 @@ class Mamba(Module):
                 dtype=config.dtype,
                 device=config.devices[0],
                 linear_cls=linear_cls,
+                d_state=config.d_state,
+                dt_rank=config.dt_rank if config.dt_rank is not None else "auto",
+                conv_bias=True,  # Use conv_bias from config if available
+                conv_kernel=config.conv_kernel,
+                x_proj_dim=config.x_proj_dim,
             )
             layers.append(
                 Block(

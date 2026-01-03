@@ -23,6 +23,10 @@ from transformers import AutoConfig
 MAMBA_SAFETENSOR_MAPPING = {
     "backbone.": "",  # Removes the "backbone" prefix if present.
     "model.": "",  # Removes the "model" prefix.
+    # Mamba-specific weight name mappings
+    # HuggingFace format: layers.{i}.mixer.A_log -> MAX format: layers.{i}.mixer.A_log
+    # HuggingFace format: layers.{i}.mixer.D -> MAX format: layers.{i}.mixer.D
+    # These should match automatically, but we handle any prefix differences here.
 }
 
 
@@ -32,7 +36,29 @@ def convert_safetensor_state_dict(
     pipeline_config: PipelineConfig,
     **unused_kwargs,
 ) -> dict[str, WeightData]:
-    """Convert safetensor state dict to MAX format."""
+    """Convert safetensor state dict to MAX format.
+    
+    This function handles weight name mapping from HuggingFace Mamba format to MAX format.
+    Key weight names that are handled:
+    - layers.{i}.mixer.A_log: State transition matrix in log space (intermediate_size, d_state)
+    - layers.{i}.mixer.D: Skip connection parameter (intermediate_size,)
+    - layers.{i}.mixer.conv1d.weight: Causal 1D convolution weight (intermediate_size, conv_width)
+    - layers.{i}.mixer.conv1d.bias: Causal 1D convolution bias (intermediate_size,)
+    - layers.{i}.mixer.in_proj.weight: Input projection weight
+    - layers.{i}.mixer.x_proj.weight: State space parameter projection weight
+    - layers.{i}.mixer.dt_proj.weight: Delta projection weight
+    - layers.{i}.mixer.dt_proj.bias: Delta projection bias (dt_bias)
+    - layers.{i}.mixer.out_proj.weight: Output projection weight
+    
+    Args:
+        state_dict: Dictionary mapping weight names to Weights objects from safetensors.
+        huggingface_config: HuggingFace model configuration.
+        pipeline_config: MAX pipeline configuration.
+        **unused_kwargs: Additional unused keyword arguments.
+        
+    Returns:
+        Dictionary mapping MAX weight names to WeightData objects.
+    """
     new_state_dict: dict[str, WeightData] = {}
     # Map the weight names.
     for safetensor_name, value in state_dict.items():

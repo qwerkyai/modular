@@ -1838,9 +1838,9 @@ fn mamba_split_conv1d_scan_combined_cpu[
     width: Int,  # Conv kernel width
     chunk_size: Int,
     delta_softplus: Int8,
-    norm_before_gate: Bool,
-    has_rmsnorm: Bool,
-    has_outproj: Bool,
+    norm_before_gate: Int8,
+    has_rmsnorm: Int8,
+    has_outproj: Int8,
     zxbcdt: LayoutTensor[kernel_dtype, zxbcdt_layout, MutAnyOrigin],  # (batch, seqlen, 2*dim + 2*ngroups*dstate + nheads)
     conv_weight: LayoutTensor[kernel_dtype, conv_weight_layout, MutAnyOrigin],  # (dim + 2*ngroups*dstate, width)
     conv_bias: LayoutTensor[kernel_dtype, conv_bias_layout, MutAnyOrigin],  # (dim + 2*ngroups*dstate,)
@@ -2166,9 +2166,9 @@ fn mamba_split_conv1d_scan_combined_gpu[
     width: Int,
     chunk_size: Int,
     delta_softplus: Int8,
-    norm_before_gate: Bool,
-    has_rmsnorm: Bool,
-    has_outproj: Bool,
+    norm_before_gate: Int8,
+    has_rmsnorm: Int8,
+    has_outproj: Int8,
     zxbcdt: LayoutTensor[kernel_dtype, zxbcdt_layout, MutAnyOrigin],
     conv_weight: LayoutTensor[kernel_dtype, conv_weight_layout, MutAnyOrigin],
     conv_bias: LayoutTensor[kernel_dtype, conv_bias_layout, MutAnyOrigin],

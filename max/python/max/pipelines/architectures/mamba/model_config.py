@@ -62,6 +62,10 @@ class MambaConfigBase(MAXModelConfigBase):
     lora_config: LoRAConfig | None = None
     dist_gemm_config: DistributedGemmConfig | None = None
     return_hidden_states: ReturnHiddenStates = ReturnHiddenStates.NONE
+    d_state: int = 16
+    dt_rank: int | None = None
+    conv_kernel: int = 4
+    x_proj_dim: int | None = None  # Can be inferred from weight shape
 
     @staticmethod
     def help() -> dict[str, str]:
@@ -82,13 +86,20 @@ class MambaConfig(MAXModelConfig, MambaConfigBase):
     ) -> KVCacheParams:
         # TODO: Implement KV cache params for Mamba
         # Mamba uses state space models, so KV cache may work differently
+        # For now, use PAGED strategy if prefix caching is enabled
+        cache_strategy = kv_cache_config.cache_strategy
+        if kv_cache_config.enable_prefix_caching:
+            from max.nn.kv_cache import KVCacheStrategy
+            if cache_strategy == KVCacheStrategy.MODEL_DEFAULT:
+                cache_strategy = KVCacheStrategy.PAGED
+        
         return KVCacheParams(
             dtype=cache_dtype,
-            n_kv_heads=1,  # Placeholder
+            n_kv_heads=1,  # Placeholder - Mamba doesn't use attention heads
             head_dim=1,  # Placeholder
             num_layers=MambaConfig.get_num_layers(huggingface_config),
             page_size=kv_cache_config.kv_cache_page_size,
-            cache_strategy=kv_cache_config.cache_strategy,
+            cache_strategy=cache_strategy,
             enable_prefix_caching=kv_cache_config.enable_prefix_caching,
             enable_kvcache_swapping_to_host=kv_cache_config.enable_kvcache_swapping_to_host,
             host_kvcache_swap_space_gb=kv_cache_config.host_kvcache_swap_space_gb,
@@ -146,9 +157,17 @@ class MambaConfig(MAXModelConfig, MambaConfigBase):
         )
 
         # Determine norm_dtype.
+        # Note: Weight adapter removes "backbone." and "model." prefixes,
+        # so we check for the weight name after prefix removal.
         norm_dtype = None
-        if "backbone.embeddings.weight" in state_dict:
-            norm_dtype = state_dict["backbone.embeddings.weight"].dtype
+        if "embeddings.weight" in state_dict:
+            weight_data = state_dict["embeddings.weight"]
+            if weight_data is not None and hasattr(weight_data, "dtype"):
+                norm_dtype = weight_data.dtype
+        elif "embedding.weight" in state_dict:
+            weight_data = state_dict["embedding.weight"]
+            if weight_data is not None and hasattr(weight_data, "dtype"):
+                norm_dtype = weight_data.dtype
 
         # Get RMS norm epsilon
         rms_norm_eps = None
@@ -163,6 +182,42 @@ class MambaConfig(MAXModelConfig, MambaConfigBase):
             huggingface_config, "tie_word_embeddings", False
         )
 
+        # Get Mamba-specific config values
+        d_state = getattr(huggingface_config, "d_state", 16)
+        dt_rank = getattr(huggingface_config, "dt_rank", None)
+        conv_kernel = getattr(huggingface_config, "conv_kernel", 4)
+        
+        # Infer x_proj_dim and dt_rank from x_proj weight shape if available
+        intermediate_size = getattr(
+            huggingface_config, "d_inner", huggingface_config.d_model * 2
+        )
+        x_proj_dim = None
+        x_proj_key = "layers.0.mixer.x_proj.weight"
+        if x_proj_key in state_dict:
+            weight_data = state_dict[x_proj_key]
+            if weight_data is not None and hasattr(weight_data, "shape"):
+                # x_proj weight shape is [out_dim, in_dim]
+                # Convert Dim to int if needed - handle both Dim and int
+                shape_0 = weight_data.shape[0]
+                if hasattr(shape_0, 'value'):
+                    x_proj_dim = int(shape_0.value)
+                else:
+                    x_proj_dim = int(shape_0)
+                
+                # Try to infer dt_rank from x_proj_dim
+                # x_proj projects to dt_rank + 2 * n_groups * d_state
+                # where n_groups = intermediate_size // d_state
+                n_groups = intermediate_size // d_state
+                # Calculate dt_rank from: x_proj_dim = dt_rank + 2 * n_groups * d_state
+                calculated_dt_rank = x_proj_dim - 2 * n_groups * d_state
+                if calculated_dt_rank > 0:
+                    dt_rank = calculated_dt_rank
+        
+        # If dt_rank is still None, calculate it
+        if dt_rank is None:
+            hidden_size = huggingface_config.d_model
+            dt_rank = max(16, hidden_size // 16)
+        
         return MambaConfig(
             hidden_size=huggingface_config.d_model,
             num_hidden_layers=huggingface_config.n_layer,
@@ -187,6 +242,10 @@ class MambaConfig(MAXModelConfig, MambaConfigBase):
             ),
             norm_method=norm_method,
             norm_dtype=norm_dtype,
+            d_state=d_state,
+            dt_rank=dt_rank,
+            conv_kernel=conv_kernel,
+            x_proj_dim=x_proj_dim,
             rms_norm_eps=rms_norm_eps,
             tie_word_embeddings=tie_word_embeddings,
             devices=device_refs,

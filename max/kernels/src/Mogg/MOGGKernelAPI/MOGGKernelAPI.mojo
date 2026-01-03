@@ -3609,7 +3609,7 @@ struct RMSNormFusedResidual:
             weight_offset,
             ctx,
             dropout_p,
-            seed.value(),
+            UInt64(seed),
         )
 
     @staticmethod
@@ -3704,22 +3704,34 @@ struct LayerNormGated:
 
         @parameter
         @always_inline
-        fn output_fn[
-            width: Int, _rank: Int, alignment: Int
-        ](coords: IndexList[_rank], val: SIMD[dtype, width]):
+        fn output_fn_cpu[
+            width: Int, alignment: Int
+        ](idx: IndexList[rank], val: SIMD[dtype, width]):
             output._fused_store[width=width, element_alignment=alignment](
-                rebind[IndexList[output.rank]](coords),
+                rebind[IndexList[output.rank]](idx),
+                rebind[SIMD[output.dtype, width]](val),
+            )
+
+        @parameter
+        @always_inline
+        fn output_fn_gpu[
+            width: Int, rank: Int, alignment: Int
+        ](idx: IndexList[rank], val: SIMD[dtype, width]):
+            output._fused_store[width=width, element_alignment=alignment](
+                rebind[IndexList[output.rank]](idx),
                 rebind[SIMD[output.dtype, width]](val),
             )
 
         @parameter
         if is_cpu[target]():
             _layer_norm_gated_impl[
+                dtype,
+                rank,
                 input_fn,
                 z_fn,
                 gamma_fn,
                 beta_fn,
-                output_fn,
+                output_fn_cpu,
                 target=target,
                 has_z=has_z,
                 has_bias=has_bias,
@@ -3738,11 +3750,11 @@ struct LayerNormGated:
                 z_fn,
                 gamma_fn,
                 beta_fn,
-                output_fn,
-                has_z=has_z,
-                has_bias=has_bias,
-                is_rms_norm=is_rms_norm,
-                norm_before_gate=norm_before_gate,
+                output_fn_gpu,
+                has_z,
+                has_bias,
+                is_rms_norm,
+                norm_before_gate,
             ](
                 input.shape(),
                 beta_tensor,
@@ -10557,11 +10569,13 @@ fn _execute_causal_conv1d_update_with_bias[
 ](
     output: OutputTensor,
     conv_state: OutputTensor,  # Note: Output because it's modified in-place
-    input: InputTensor,
-    weight: InputTensor,
-    bias: InputTensor,
+    input: FusedInputTensor[dtype=output.dtype, rank=output.rank],
+    weight: InputTensor[dtype=output.dtype, rank=2],
+    bias: InputTensor[dtype=output.dtype, rank=1],
     ctx: DeviceContextPtr,
 ) raises:
+    comptime dtype = output.dtype
+    comptime rank = output.rank
     if input.rank != 3:
         raise Error("Input tensor x must be rank 3 for update (B, C, L)")
     if conv_state.rank != 3:
@@ -10706,10 +10720,12 @@ fn _execute_causal_conv1d_update_no_bias[
 ](
     output: OutputTensor,
     conv_state: OutputTensor,
-    input: InputTensor,
-    weight: InputTensor,
+    input: FusedInputTensor[dtype=output.dtype, rank=output.rank],
+    weight: InputTensor[dtype=output.dtype, rank=2],
     ctx: DeviceContextPtr,
 ) raises:
+    alias dtype = output.dtype
+    alias rank = output.rank
     if input.rank != 3:
         raise Error("Input tensor x must be rank 3 for update (B, C, L)")
     if conv_state.rank != 3:
@@ -11032,7 +11048,7 @@ struct SelectiveScanFwd[delta_softplus: Bool = False]:
         var z_strides = z.strides()
         var delta_bias_strides = delta_bias.strides()
         
-        comptime delta_softplus_int8: Int8 = Int8(1) if delta_softplus else Int8(0)
+        comptime delta_softplus_int8: Int8 = Int8(1) if Self.delta_softplus else Int8(0)
         
         @parameter
         if is_cpu[target]():
@@ -11452,716 +11468,6 @@ struct SelectiveScanUpdate[delta_softplus: Bool = False]:
         dt_bias: InputTensor[dtype=dtype, rank=1],
     ) -> IndexList[3]:
         return state_in.shape()
-
-
-# ===----------------------------------------------------------------------=== #
-# SSD Combined: Selective Scan Discrete Combined Operation
-# ===----------------------------------------------------------------------=== #
-
-@compiler.register("ssd_combined")
-struct SSDCombined[delta_softplus: Bool = False]:
-    """SSD combined operation for Mamba SSM.
-    
-    Combines selective scan with normalization and residual connections.
-    Performs: norm(residual + selective_scan(input))
-    
-    Parameters:
-        delta_softplus: If True, applies softplus activation to delta values.
-    
-    Tensor Shapes:
-        - output: (batch, dim, seqlen) - Output tensor
-        - x: (batch, dim, num_chunks, 2*dstate) - Checkpoint tensor for chunking
-        - out_z: (batch, dim, seqlen) - Gated output (if z is provided)
-        - residual: (batch, dim, seqlen) - Residual input tensor
-        - u: (batch, dim, seqlen) - Input tensor
-        - delta: (batch, dim, seqlen) - Time step tensor
-        - A: (dim, dstate) - State transition matrix
-        - B: (batch, n_groups, dstate, seqlen) - Input projection
-        - C: (batch, n_groups, dstate, seqlen) - Output projection
-        - D: (dim,) - Skip connection (optional, can be empty)
-        - z: (batch, dim, seqlen) - Gating tensor (optional, can be empty)
-        - delta_bias: (dim,) - Delta bias (optional, can be empty)
-        - gamma: (dim,) - Normalization weight
-    """
-    @staticmethod
-    fn execute[
-        dtype: DType,
-        rank: Int,
-        target: StaticString,
-    ](
-        output: OutputTensor[dtype=dtype, rank=3],
-        x: OutputTensor[dtype=dtype, rank=4],
-        out_z: OutputTensor[dtype=dtype, rank=3],
-        residual: FusedInputTensor[dtype=dtype, rank=3],
-        u: FusedInputTensor[dtype=dtype, rank=3],
-        delta: InputTensor[dtype=dtype, rank=3],
-        A: InputTensor[dtype=dtype, rank=2],
-        B: InputTensor[dtype=dtype, rank=4],
-        C: InputTensor[dtype=dtype, rank=4],
-        D: InputTensor[dtype=dtype, rank=1],
-        z: InputTensor[dtype=dtype, rank=3],
-        delta_bias: InputTensor[dtype=dtype, rank=1],
-        gamma: InputTensor[dtype=dtype, rank=1],
-        epsilon: Scalar[dtype=dtype],
-        weight_offset: Scalar[dtype=dtype],
-        ctx: DeviceContextPtr,
-    ) capturing raises:
-        if output.rank != 3:
-            raise Error("Output tensor must be rank 3 (batch, dim, seqlen)")
-        if u.rank != 3:
-            raise Error("Input tensor u must be rank 3 (batch, dim, seqlen)")
-        if delta.rank != 3:
-            raise Error("Delta tensor must be rank 3 (batch, dim, seqlen)")
-        if residual.rank != 3:
-            raise Error("Residual tensor must be rank 3 (batch, dim, seqlen)")
-        if A.rank != 2:
-            raise Error("A tensor must be rank 2 (dim, dstate)")
-        if B.rank != 4:
-            raise Error("B tensor must be rank 4 (batch, n_groups, dstate, seqlen)")
-        if C.rank != 4:
-            raise Error("C tensor must be rank 4 (batch, n_groups, dstate, seqlen)")
-        if gamma.rank != 1:
-            raise Error("Gamma tensor must be rank 1 (dim,)")
-        
-        var batch = output.dim_size(0)
-        var dim = output.dim_size(1)
-        var seqlen = output.dim_size(2)
-        var dstate = A.dim_size(1)
-        var n_groups = B.dim_size(1)
-        var group_size = dim // n_groups
-        
-        var output_lt = output.to_layout_tensor()
-        var x_lt = x.to_layout_tensor()
-        var out_z_lt = out_z.to_layout_tensor()
-        var residual_lt = residual.to_layout_tensor()
-        var u_lt = u.to_layout_tensor()
-        var delta_lt = delta.to_layout_tensor()
-        var A_lt = A.to_layout_tensor()
-        var B_lt = B.to_layout_tensor()
-        var C_lt = C.to_layout_tensor()
-        var D_lt = D.to_layout_tensor()
-        var z_lt = z.to_layout_tensor()
-        var delta_bias_lt = delta_bias.to_layout_tensor()
-        var gamma_lt = gamma.to_layout_tensor()
-        
-        var output_strides = output.strides()
-        var x_strides = x.strides()
-        var out_z_strides = out_z.strides()
-        var residual_strides = residual.strides()
-        var u_strides = u.strides()
-        var delta_strides = delta.strides()
-        var A_strides = A.strides()
-        var B_strides = B.strides()
-        var C_strides = C.strides()
-        var D_strides = D.strides()
-        var z_strides = z.strides()
-        var delta_bias_strides = delta_bias.strides()
-        var gamma_strides = gamma.strides()
-        
-        comptime delta_softplus_int8: Int8 = Int8(1) if delta_softplus else Int8(0)
-        
-        @parameter
-        if is_cpu[target]():
-            ssd_combined_cpu[
-                dtype,
-                output_lt.layout,
-                x_lt.layout,
-                out_z_lt.layout,
-                residual_lt.layout,
-                u_lt.layout,
-                delta_lt.layout,
-                A_lt.layout,
-                B_lt.layout,
-                C_lt.layout,
-                D_lt.layout,
-                z_lt.layout,
-                delta_bias_lt.layout,
-                gamma_lt.layout,
-            ](
-                batch,
-                dim,
-                seqlen,
-                dstate,
-                group_size,
-                delta_softplus_int8,
-                output_lt,
-                x_lt,
-                out_z_lt,
-                residual_lt,
-                u_lt,
-                delta_lt,
-                A_lt,
-                B_lt,
-                C_lt,
-                D_lt,
-                z_lt,
-                delta_bias_lt,
-                gamma_lt,
-                epsilon,
-                weight_offset,
-                UInt32(output_strides[0]),
-                UInt32(output_strides[1]),
-                UInt32(output_strides[2]),
-                UInt32(x_strides[0]),
-                UInt32(x_strides[1]),
-                UInt32(x_strides[2]),
-                UInt32(x_strides[3]),
-                UInt32(out_z_strides[0]),
-                UInt32(out_z_strides[1]),
-                UInt32(out_z_strides[2]),
-                UInt32(residual_strides[0]),
-                UInt32(residual_strides[1]),
-                UInt32(residual_strides[2]),
-                UInt32(u_strides[0]),
-                UInt32(u_strides[1]),
-                UInt32(u_strides[2]),
-                UInt32(delta_strides[0]),
-                UInt32(delta_strides[1]),
-                UInt32(delta_strides[2]),
-                UInt32(A_strides[0]),
-                UInt32(A_strides[1]),
-                UInt32(B_strides[0]),
-                UInt32(B_strides[1]),
-                UInt32(B_strides[2]),
-                UInt32(B_strides[3]),
-                UInt32(C_strides[0]),
-                UInt32(C_strides[1]),
-                UInt32(C_strides[2]),
-                UInt32(C_strides[3]),
-                UInt32(D_strides[0]),
-                UInt32(z_strides[0]),
-                UInt32(z_strides[1]),
-                UInt32(z_strides[2]),
-                UInt32(delta_bias_strides[0]),
-                UInt32(gamma_strides[0]),
-            )
-        elif is_gpu[target]():
-            var gpu_ctx = ctx.get_device_context()
-            var total_batch_dim = batch * dim
-            comptime BLOCK_SIZE = 128
-            var num_blocks = ceildiv(total_batch_dim, BLOCK_SIZE)
-            
-            var compiled_kernel = gpu_ctx.compile_function_checked[
-                ssd_combined_gpu[
-                    dtype,
-                    output_lt.layout,
-                    x_lt.layout,
-                    out_z_lt.layout,
-                    residual_lt.layout,
-                    u_lt.layout,
-                    delta_lt.layout,
-                    A_lt.layout,
-                    B_lt.layout,
-                    C_lt.layout,
-                    D_lt.layout,
-                    z_lt.layout,
-                    delta_bias_lt.layout,
-                    gamma_lt.layout,
-                ],
-                ssd_combined_gpu[
-                    dtype,
-                    output_lt.layout,
-                    x_lt.layout,
-                    out_z_lt.layout,
-                    residual_lt.layout,
-                    u_lt.layout,
-                    delta_lt.layout,
-                    A_lt.layout,
-                    B_lt.layout,
-                    C_lt.layout,
-                    D_lt.layout,
-                    z_lt.layout,
-                    delta_bias_lt.layout,
-                    gamma_lt.layout,
-                ]
-            ]()
-            
-            gpu_ctx.enqueue_function_checked(
-                compiled_kernel,
-                total_batch_dim,
-                batch,
-                dim,
-                seqlen,
-                dstate,
-                group_size,
-                delta_softplus_int8,
-                output_lt,
-                x_lt,
-                out_z_lt,
-                residual_lt,
-                u_lt,
-                delta_lt,
-                A_lt,
-                B_lt,
-                C_lt,
-                D_lt,
-                z_lt,
-                delta_bias_lt,
-                gamma_lt,
-                epsilon,
-                weight_offset,
-                UInt32(output_strides[0]),
-                UInt32(output_strides[1]),
-                UInt32(output_strides[2]),
-                UInt32(x_strides[0]),
-                UInt32(x_strides[1]),
-                UInt32(x_strides[2]),
-                UInt32(x_strides[3]),
-                UInt32(out_z_strides[0]),
-                UInt32(out_z_strides[1]),
-                UInt32(out_z_strides[2]),
-                UInt32(residual_strides[0]),
-                UInt32(residual_strides[1]),
-                UInt32(residual_strides[2]),
-                UInt32(u_strides[0]),
-                UInt32(u_strides[1]),
-                UInt32(u_strides[2]),
-                UInt32(delta_strides[0]),
-                UInt32(delta_strides[1]),
-                UInt32(delta_strides[2]),
-                UInt32(A_strides[0]),
-                UInt32(A_strides[1]),
-                UInt32(B_strides[0]),
-                UInt32(B_strides[1]),
-                UInt32(B_strides[2]),
-                UInt32(B_strides[3]),
-                UInt32(C_strides[0]),
-                UInt32(C_strides[1]),
-                UInt32(C_strides[2]),
-                UInt32(C_strides[3]),
-                UInt32(D_strides[0]),
-                UInt32(z_strides[0]),
-                UInt32(z_strides[1]),
-                UInt32(z_strides[2]),
-                UInt32(delta_bias_strides[0]),
-                UInt32(gamma_strides[0]),
-                grid_dim=(num_blocks,),
-                block_dim=(BLOCK_SIZE,),
-            )
-        else:
-            raise Error("Unsupported target: " + target)
-    
-    @staticmethod
-    fn shape[
-        dtype: DType,
-    ](
-        residual: InputTensor[dtype=dtype, rank=3],
-        u: InputTensor[dtype=dtype, rank=3],
-        delta: InputTensor[dtype=dtype, rank=3],
-        A: InputTensor[dtype=dtype, rank=2],
-        B: InputTensor[dtype=dtype, rank=4],
-        C: InputTensor[dtype=dtype, rank=4],
-        D: InputTensor[dtype=dtype, rank=1],
-        z: InputTensor[dtype=dtype, rank=3],
-        delta_bias: InputTensor[dtype=dtype, rank=1],
-        gamma: InputTensor[dtype=dtype, rank=1],
-    ) -> IndexList[3]:
-        return residual.shape()
-
-
-# ===----------------------------------------------------------------------=== #
-# Mamba Split Conv1D Scan Combined: Fused operation combining conv1d, split, and scan
-# ===----------------------------------------------------------------------=== #
-
-@compiler.register("mamba_split_conv1d_scan_combined")
-struct MambaSplitConv1dScanCombined[
-    delta_softplus: Bool = True,
-    norm_before_gate: Bool = True,
-    has_rmsnorm: Bool = False,
-    has_outproj: Bool = False,
-]:
-    """Mamba split conv1d scan combined operation.
-    
-    Fused operation that:
-    1. Splits input zxbcdt into z, xBC, dt
-    2. Applies causal conv1d to xBC with SiLU activation
-    3. Splits conv output into x, B, C
-    4. Applies selective scan
-    5. Optionally applies RMSNorm with gating
-    6. Optionally applies output projection
-    
-    Parameters:
-        delta_softplus: If True, applies softplus activation to delta values.
-        norm_before_gate: If True, applies RMSNorm before gating; if False, after.
-        has_rmsnorm: If True, applies RMSNorm with gating.
-        has_outproj: If True, applies output projection.
-    
-    Tensor Shapes:
-        - output: (batch, seqlen, dim) or (batch, seqlen, out_dim) - Output tensor
-        - zxbcdt: (batch, seqlen, 2*dim + 2*ngroups*dstate + nheads) - Combined input
-        - conv_weight: (dim + 2*ngroups*dstate, width) - Conv1d weights
-        - conv_bias: (dim + 2*ngroups*dstate,) - Conv1d bias
-        - dt_bias: (nheads,) - Delta bias
-        - A: (nheads,) - State transition matrix
-        - D: (nheads, headdim) or (nheads,) - Skip connection (optional)
-        - x: (batch, dim, num_chunks, 2*dstate) - Checkpoint tensor
-        - out_z: (batch, dim, seqlen) - Gated output
-        - dt: (batch, nheads, seqlen) - Time step tensor
-        - B: (batch, ngroups, dstate, seqlen) - Input projection
-        - C: (batch, ngroups, dstate, seqlen) - Output projection
-        - z: (batch, dim, seqlen) - Gating tensor
-        - rmsnorm_weight: (dim,) - RMSNorm weight (optional)
-        - outproj_weight: (out_dim, dim) - Output projection weight (optional)
-        - outproj_bias: (out_dim,) - Output projection bias (optional)
-    """
-    @staticmethod
-    fn execute[
-        dtype: DType,
-        rank: Int,
-        target: StaticString,
-    ](
-        output: OutputTensor[dtype=dtype, rank=3],
-        zxbcdt: FusedInputTensor[dtype=dtype, rank=3],
-        conv_weight: InputTensor[dtype=dtype, rank=2],
-        conv_bias: InputTensor[dtype=dtype, rank=1],
-        dt_bias: InputTensor[dtype=dtype, rank=1],
-        A: InputTensor[dtype=dtype, rank=1],
-        D: InputTensor[dtype=dtype, rank=2],
-        x: OutputTensor[dtype=dtype, rank=4],
-        out_z: OutputTensor[dtype=dtype, rank=3],
-        dt: OutputTensor[dtype=dtype, rank=3],
-        B: OutputTensor[dtype=dtype, rank=4],
-        C: OutputTensor[dtype=dtype, rank=4],
-        z: OutputTensor[dtype=dtype, rank=3],
-        rmsnorm_weight: InputTensor[dtype=dtype, rank=1],
-        outproj_weight: InputTensor[dtype=dtype, rank=2],
-        outproj_bias: InputTensor[dtype=dtype, rank=1],
-        chunk_size: Scalar[dtype=DType.int64],
-        width: Scalar[dtype=DType.int64],
-        nheads: Scalar[dtype=DType.int64],
-        headdim: Scalar[dtype=DType.int64],
-        dstate: Scalar[dtype=DType.int64],
-        ngroups: Scalar[dtype=DType.int64],
-        epsilon: Scalar[dtype=dtype],
-        ctx: DeviceContextPtr,
-    ) capturing raises:
-        if output.rank != 3:
-            raise Error("Output tensor must be rank 3 (batch, seqlen, dim)")
-        if zxbcdt.rank != 3:
-            raise Error("zxbcdt tensor must be rank 3 (batch, seqlen, channels)")
-        if conv_weight.rank != 2:
-            raise Error("conv_weight tensor must be rank 2 (channels, width)")
-        if conv_bias.rank != 1:
-            raise Error("conv_bias tensor must be rank 1 (channels,)")
-        if dt_bias.rank != 1:
-            raise Error("dt_bias tensor must be rank 1 (nheads,)")
-        if A.rank != 1:
-            raise Error("A tensor must be rank 1 (nheads,)")
-        if B.rank != 4:
-            raise Error("B tensor must be rank 4 (batch, ngroups, dstate, seqlen)")
-        if C.rank != 4:
-            raise Error("C tensor must be rank 4 (batch, ngroups, dstate, seqlen)")
-        if x.rank != 4:
-            raise Error("x tensor must be rank 4 (batch, dim, num_chunks, 2*dstate)")
-        if out_z.rank != 3:
-            raise Error("out_z tensor must be rank 3 (batch, dim, seqlen)")
-        if dt.rank != 3:
-            raise Error("dt tensor must be rank 3 (batch, nheads, seqlen)")
-        if z.rank != 3:
-            raise Error("z tensor must be rank 3 (batch, dim, seqlen)")
-        
-        var batch = output.dim_size(0)
-        var seqlen = output.dim_size(1)
-        var output_dim = output.dim_size(2)
-        var zxbcdt_channels = zxbcdt.dim_size(2)
-        var conv_weight_channels = conv_weight.dim_size(0)
-        var conv_width = Int(conv_weight.dim_size(1))
-        var nheads_val = Int(nheads.value)
-        var headdim_val = Int(headdim.value)
-        var dim = nheads_val * headdim_val
-        var dstate_val = Int(dstate.value)
-        var ngroups_val = Int(ngroups.value)
-        var chunk_size_val = Int(chunk_size.value)
-        var width_val = Int(width.value)
-        
-        # Validate dimensions
-        var expected_zxbcdt_channels = 2 * dim + 2 * ngroups_val * dstate_val + nheads_val
-        if zxbcdt_channels != expected_zxbcdt_channels:
-            raise Error("zxbcdt channels mismatch")
-        
-        var expected_conv_channels = dim + 2 * ngroups_val * dstate_val
-        if conv_weight_channels != expected_conv_channels:
-            raise Error("conv_weight channels mismatch")
-        
-        var output_lt = output.to_layout_tensor()
-        var zxbcdt_lt = zxbcdt.to_layout_tensor()
-        var conv_weight_lt = conv_weight.to_layout_tensor()
-        var conv_bias_lt = conv_bias.to_layout_tensor()
-        var dt_bias_lt = dt_bias.to_layout_tensor()
-        var A_lt = A.to_layout_tensor()
-        var D_lt = D.to_layout_tensor()
-        var x_lt = x.to_layout_tensor()
-        var out_z_lt = out_z.to_layout_tensor()
-        var dt_lt = dt.to_layout_tensor()
-        var B_lt = B.to_layout_tensor()
-        var C_lt = C.to_layout_tensor()
-        var z_lt = z.to_layout_tensor()
-        var rmsnorm_weight_lt = rmsnorm_weight.to_layout_tensor()
-        var outproj_weight_lt = outproj_weight.to_layout_tensor()
-        var outproj_bias_lt = outproj_bias.to_layout_tensor()
-        
-        var output_strides = output.strides()
-        var zxbcdt_strides = zxbcdt.strides()
-        var conv_weight_strides = conv_weight.strides()
-        var conv_bias_strides = conv_bias.strides()
-        var dt_bias_strides = dt_bias.strides()
-        var A_strides = A.strides()
-        var D_strides = D.strides()
-        var x_strides = x.strides()
-        var out_z_strides = out_z.strides()
-        var dt_strides = dt.strides()
-        var B_strides = B.strides()
-        var C_strides = C.strides()
-        var z_strides = z.strides()
-        var rmsnorm_weight_strides = rmsnorm_weight.strides()
-        var outproj_weight_strides = outproj_weight.strides()
-        var outproj_bias_strides = outproj_bias.strides()
-        
-        comptime delta_softplus_int8: Int8 = Int8(1) if delta_softplus else Int8(0)
-        
-        @parameter
-        if is_cpu[target]():
-            mamba_split_conv1d_scan_combined_cpu[
-                dtype,
-                zxbcdt_lt.layout,
-                conv_weight_lt.layout,
-                conv_bias_lt.layout,
-                output_lt.layout,
-                x_lt.layout,
-                out_z_lt.layout,
-                dt_lt.layout,
-                A_lt.layout,
-                B_lt.layout,
-                C_lt.layout,
-                D_lt.layout,
-                z_lt.layout,
-                dt_bias_lt.layout,
-                rmsnorm_weight_lt.layout,
-                outproj_weight_lt.layout,
-                outproj_bias_lt.layout,
-            ](
-                batch,
-                seqlen,
-                dim,
-                nheads_val,
-                headdim_val,
-                dstate_val,
-                ngroups_val,
-                width_val,
-                chunk_size_val,
-                delta_softplus_int8,
-                norm_before_gate,
-                has_rmsnorm,
-                has_outproj,
-                zxbcdt_lt,
-                conv_weight_lt,
-                conv_bias_lt,
-                dt_bias_lt,
-                A_lt,
-                D_lt,
-                x_lt,
-                out_z_lt,
-                dt_lt,
-                B_lt,
-                C_lt,
-                z_lt,
-                rmsnorm_weight_lt,
-                outproj_weight_lt,
-                outproj_bias_lt,
-                output_lt,
-                epsilon,
-                UInt32(zxbcdt_strides[0]),
-                UInt32(zxbcdt_strides[1]),
-                UInt32(zxbcdt_strides[2]),
-                UInt32(conv_weight_strides[0]),
-                UInt32(conv_weight_strides[1]),
-                UInt32(conv_bias_strides[0]),
-                UInt32(output_strides[0]),
-                UInt32(output_strides[1]),
-                UInt32(output_strides[2]),
-                UInt32(x_strides[0]),
-                UInt32(x_strides[1]),
-                UInt32(x_strides[2]),
-                UInt32(x_strides[3]),
-                UInt32(out_z_strides[0]),
-                UInt32(out_z_strides[1]),
-                UInt32(out_z_strides[2]),
-                UInt32(dt_strides[0]),
-                UInt32(dt_strides[1]),
-                UInt32(dt_strides[2]),
-                UInt32(A_strides[0]),
-                UInt32(B_strides[0]),
-                UInt32(B_strides[1]),
-                UInt32(B_strides[2]),
-                UInt32(B_strides[3]),
-                UInt32(C_strides[0]),
-                UInt32(C_strides[1]),
-                UInt32(C_strides[2]),
-                UInt32(C_strides[3]),
-                UInt32(D_strides[0]),
-                UInt32(D_strides[1]),
-                UInt32(z_strides[0]),
-                UInt32(z_strides[1]),
-                UInt32(z_strides[2]),
-                UInt32(dt_bias_strides[0]),
-                UInt32(rmsnorm_weight_strides[0]),
-                UInt32(outproj_weight_strides[0]),
-                UInt32(outproj_weight_strides[1]),
-                UInt32(outproj_bias_strides[0]),
-            )
-        elif is_gpu[target]():
-            var gpu_ctx = ctx.get_device_context()
-            var total_batch_dim = batch * dim
-            comptime BLOCK_SIZE = 128
-            var num_blocks = ceildiv(total_batch_dim, BLOCK_SIZE)
-            
-            var compiled_kernel = gpu_ctx.compile_function_checked[
-                mamba_split_conv1d_scan_combined_gpu[
-                    dtype,
-                    zxbcdt_lt.layout,
-                    conv_weight_lt.layout,
-                    conv_bias_lt.layout,
-                    output_lt.layout,
-                    x_lt.layout,
-                    out_z_lt.layout,
-                    dt_lt.layout,
-                    A_lt.layout,
-                    B_lt.layout,
-                    C_lt.layout,
-                    D_lt.layout,
-                    z_lt.layout,
-                    dt_bias_lt.layout,
-                    rmsnorm_weight_lt.layout,
-                    outproj_weight_lt.layout,
-                    outproj_bias_lt.layout,
-                ],
-                mamba_split_conv1d_scan_combined_gpu[
-                    dtype,
-                    zxbcdt_lt.layout,
-                    conv_weight_lt.layout,
-                    conv_bias_lt.layout,
-                    output_lt.layout,
-                    x_lt.layout,
-                    out_z_lt.layout,
-                    dt_lt.layout,
-                    A_lt.layout,
-                    B_lt.layout,
-                    C_lt.layout,
-                    D_lt.layout,
-                    z_lt.layout,
-                    dt_bias_lt.layout,
-                    rmsnorm_weight_lt.layout,
-                    outproj_weight_lt.layout,
-                    outproj_bias_lt.layout,
-                ]
-            ]()
-            
-            gpu_ctx.enqueue_function_checked(
-                compiled_kernel,
-                total_batch_dim,
-                batch,
-                seqlen,
-                dim,
-                nheads_val,
-                headdim_val,
-                dstate_val,
-                ngroups_val,
-                width_val,
-                chunk_size_val,
-                delta_softplus_int8,
-                norm_before_gate,
-                has_rmsnorm,
-                has_outproj,
-                zxbcdt_lt,
-                conv_weight_lt,
-                conv_bias_lt,
-                dt_bias_lt,
-                A_lt,
-                D_lt,
-                x_lt,
-                out_z_lt,
-                dt_lt,
-                B_lt,
-                C_lt,
-                z_lt,
-                rmsnorm_weight_lt,
-                outproj_weight_lt,
-                outproj_bias_lt,
-                output_lt,
-                epsilon,
-                UInt32(zxbcdt_strides[0]),
-                UInt32(zxbcdt_strides[1]),
-                UInt32(zxbcdt_strides[2]),
-                UInt32(conv_weight_strides[0]),
-                UInt32(conv_weight_strides[1]),
-                UInt32(conv_bias_strides[0]),
-                UInt32(output_strides[0]),
-                UInt32(output_strides[1]),
-                UInt32(output_strides[2]),
-                UInt32(x_strides[0]),
-                UInt32(x_strides[1]),
-                UInt32(x_strides[2]),
-                UInt32(x_strides[3]),
-                UInt32(out_z_strides[0]),
-                UInt32(out_z_strides[1]),
-                UInt32(out_z_strides[2]),
-                UInt32(dt_strides[0]),
-                UInt32(dt_strides[1]),
-                UInt32(dt_strides[2]),
-                UInt32(A_strides[0]),
-                UInt32(B_strides[0]),
-                UInt32(B_strides[1]),
-                UInt32(B_strides[2]),
-                UInt32(B_strides[3]),
-                UInt32(C_strides[0]),
-                UInt32(C_strides[1]),
-                UInt32(C_strides[2]),
-                UInt32(C_strides[3]),
-                UInt32(D_strides[0]),
-                UInt32(D_strides[1]),
-                UInt32(z_strides[0]),
-                UInt32(z_strides[1]),
-                UInt32(z_strides[2]),
-                UInt32(dt_bias_strides[0]),
-                UInt32(rmsnorm_weight_strides[0]),
-                UInt32(outproj_weight_strides[0]),
-                UInt32(outproj_weight_strides[1]),
-                UInt32(outproj_bias_strides[0]),
-                grid_dim=(num_blocks,),
-                block_dim=(BLOCK_SIZE,),
-            )
-        else:
-            raise Error("Unsupported target: " + target)
-    
-    @staticmethod
-    fn shape[
-        dtype: DType,
-    ](
-        output: InputTensor[dtype=dtype, rank=3],
-        zxbcdt: InputTensor[dtype=dtype, rank=3],
-        conv_weight: InputTensor[dtype=dtype, rank=2],
-        conv_bias: InputTensor[dtype=dtype, rank=1],
-        dt_bias: InputTensor[dtype=dtype, rank=1],
-        A: InputTensor[dtype=dtype, rank=1],
-        D: InputTensor[dtype=dtype, rank=2],
-        x: InputTensor[dtype=dtype, rank=4],
-        out_z: InputTensor[dtype=dtype, rank=3],
-        dt: InputTensor[dtype=dtype, rank=3],
-        B: InputTensor[dtype=dtype, rank=4],
-        C: InputTensor[dtype=dtype, rank=4],
-        z: InputTensor[dtype=dtype, rank=3],
-        rmsnorm_weight: InputTensor[dtype=dtype, rank=1],
-        outproj_weight: InputTensor[dtype=dtype, rank=2],
-        outproj_bias: InputTensor[dtype=dtype, rank=1],
-        chunk_size: Scalar[dtype=DType.int64],
-        width: Scalar[dtype=DType.int64],
-        nheads: Scalar[dtype=DType.int64],
-        headdim: Scalar[dtype=DType.int64],
-        dstate: Scalar[dtype=DType.int64],
-        ngroups: Scalar[dtype=DType.int64],
-        epsilon: Scalar[dtype=dtype],
-    ) -> IndexList[3]:
-        return output.shape()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -12788,13 +12094,13 @@ struct VarlenSelectiveScanFwd:
         delta_softplus: Bool,
     ](
         ssm_states: OutputTensor[rank=3],
-        u: InputTensor[dtype=ssm_states.dtype, rank=2],
         delta: OutputTensor[dtype=ssm_states.dtype, rank=2],
+        z: OutputTensor[dtype=ssm_states.dtype, rank=2],
+        u: InputTensor[dtype=ssm_states.dtype, rank=2],
         A: InputTensor[dtype=ssm_states.dtype, rank=2],
         B: InputTensor[dtype=ssm_states.dtype, rank=3],
         C: InputTensor[dtype=ssm_states.dtype, rank=3],
         D: InputTensor[dtype=ssm_states.dtype, rank=1],
-        z: OutputTensor[dtype=ssm_states.dtype, rank=2],
         delta_bias: InputTensor[dtype=ssm_states.dtype, rank=1],
         query_start_loc: InputTensor[dtype=DType.int32, rank=1],
         cache_indices: InputTensor[dtype=DType.int32, rank=1],
@@ -12824,12 +12130,10 @@ struct VarlenSelectiveScanFwd:
     @staticmethod
     fn shape(
         u: InputTensor,
-        delta: InputTensor,
         A: InputTensor,
         B: InputTensor,
         C: InputTensor,
         D: InputTensor,
-        z: InputTensor,
         delta_bias: InputTensor,
         query_start_loc: InputTensor,
         cache_indices: InputTensor,

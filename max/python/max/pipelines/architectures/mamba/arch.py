@@ -28,7 +28,7 @@ from .model import MambaModel
 mamba_arch = SupportedArchitecture(
     name="MambaForCausalLM",
     example_repo_ids=[
-        # TODO: Add example repo IDs for Mamba models
+        "state-spaces/mamba-130m-hf",
     ],
     default_encoding=SupportedEncoding.bfloat16,
     supported_encodings={
