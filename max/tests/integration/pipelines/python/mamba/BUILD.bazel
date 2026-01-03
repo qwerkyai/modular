@@ -13,7 +13,12 @@ package(default_visibility = [
     "//open-source/max/max/tests:__subpackages__",
 ])
 
-# MOGGKernelAPI in PROD_MOJOPKGS contains causal_conv1d and selective_scan_fwd
+# Mamba-specific kernels (causal_conv1d, selective_scan_fwd) are in a separate
+# package to avoid conflicts with default kernels.
+MAMBA_MOJOPKGS = [
+    "//max/kernels/src/Mogg/MambaKernelAPI:MambaKernelAPI",
+]
+
 modular_py_test(
     name = "test_mamba_130m",
     size = "enormous",
@@ -27,7 +32,7 @@ modular_py_test(
         "../",  # For hf_repo_lock
     ],
     mojo_deps = select({
-        "//:emit_mojo_enabled": PROD_MOJOPKGS,
+        "//:emit_mojo_enabled": PROD_MOJOPKGS + MAMBA_MOJOPKGS,
         "//conditions:default": [],
     }),
     tags = [

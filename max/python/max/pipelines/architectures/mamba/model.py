@@ -90,10 +90,11 @@ def _get_kernel_library_paths() -> list[Path]:
             logger.debug(f"Path does not exist: {entry_path}")
             continue
 
-        # Load MOGGKernelAPI - the main kernel package containing all kernels
-        # including causal_conv1d and selective_scan_fwd
-        if "MOGGKernelAPI" not in entry_path.name:
-            logger.debug(f"Skipping non-MOGGKernelAPI path: {entry_path}")
+        # Only load MambaKernelAPI - the package containing mamba-specific kernels
+        # MambaKernelAPI contains only causal_conv1d and selective_scan_fwd,
+        # avoiding conflicts with default kernels like rms_norm
+        if "MambaKernelAPI" not in entry_path.name:
+            logger.debug(f"Skipping non-MambaKernelAPI path: {entry_path}")
             continue
 
         # If it's a directory, look for .mojopkg files inside
@@ -108,7 +109,7 @@ def _get_kernel_library_paths() -> list[Path]:
             paths.append(entry_path)
 
     if not paths:
-        logger.warning(f"No MOGGKernelAPI.mojopkg found in {import_path_env}")
+        logger.warning(f"No MambaKernelAPI.mojopkg found in {import_path_env}")
     return paths
 
 
