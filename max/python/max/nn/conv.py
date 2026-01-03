@@ -26,7 +26,7 @@ from max.graph import (
     Weight,
     ops,
 )
-from max.graph.type import FilterLayout
+from max.graph.type import FilterLayout, TensorType
 
 from .layer import Layer, Module, Shardable
 
@@ -885,3 +885,85 @@ class Conv3D(Module):
         if self.permute:
             res = ops.permute(res, [0, 4, 1, 2, 3])
         return res
+
+
+# ===----------------------------------------------------------------------=== #
+# Causal Conv1D Functional API
+# ===----------------------------------------------------------------------=== #
+
+
+def causal_conv1d_fn(
+    x: TensorValue,
+    weight: TensorValue,
+    bias: TensorValue | None = None,
+    algorithm: str = "optimized",
+    activation: str = "none",
+) -> TensorValue:
+    """Causal 1D convolution function matching Mamba API.
+    
+    Performs causal (autoregressive) 1D convolution where each output position
+    depends only on current and past input positions. This is used in Mamba
+    models for sequence processing.
+    
+    Reference: https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/triton/causal_conv1d.py
+    
+    Args:
+        x: Input tensor of shape (batch, channels, seqlen).
+        weight: Weight tensor of shape (channels, width).
+        bias: Optional bias tensor of shape (channels,).
+        algorithm: Convolution algorithm to use.
+            - "naive": Simple loop-based implementation, works for all widths.
+            - "optimized": SIMD-vectorized, supports widths 1, 2, 3, 4 on GPU.
+        activation: Activation function to apply after convolution.
+            - "none": No activation (identity).
+            - "silu": SiLU/Swish activation (x * sigmoid(x)).
+            
+    Returns:
+        Output tensor of shape (batch, channels, seqlen), same as input.
+    """
+    # Normalize parameters
+    algorithm_param = algorithm.lower() if algorithm else "optimized"
+    if algorithm_param not in ["naive", "optimized"]:
+        algorithm_param = "optimized"
+    
+    activation_param = activation.lower() if activation else "none"
+    if activation_param not in ["none", "silu", "swish"]:
+        activation_param = "none"
+    if activation_param == "swish":
+        activation_param = "silu"
+    
+    # Prepare tensors - ensure they're on the same device
+    weight_cast = weight.cast(x.dtype)
+    if x.device:
+        weight_cast = weight_cast.to(x.device)
+    
+    # Create bias tensor (required by kernel, use zeros if not provided)
+    if bias is None:
+        # Create zero bias tensor
+        bias_tensor = ops.broadcast_to(
+            ops.constant(0.0, x.dtype, device=x.device or DeviceRef.CPU()),
+            shape=(x.shape[-2],),  # channels dimension
+        )
+    else:
+        bias_tensor = bias.cast(x.dtype)
+        if x.device:
+            bias_tensor = bias_tensor.to(x.device)
+    
+    # Call causal_conv1d kernel
+    # The kernel returns (output, xx2D_scratch), we only need the output
+    results = ops.custom(
+        "causal_conv1d",
+        x.device,
+        [x, weight_cast, bias_tensor],
+        [
+            TensorType(dtype=x.dtype, shape=x.shape, device=x.device),  # output
+            TensorType(dtype=x.dtype, shape=x.shape, device=x.device),  # xx2D scratch (discarded)
+        ],
+        parameters={
+            "algorithm": algorithm_param,
+            "activation": activation_param,
+        },
+    )
+    
+    # Return only the output (first result), discard the scratch tensor
+    return results[0].tensor
