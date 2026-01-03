@@ -201,12 +201,8 @@ from nn.mla_graph import (
 from nn.moe import moe_create_indices, router_group_limited
 from nn.nms import non_max_suppression, non_max_suppression_shape_func
 from nn.causal_conv1d import (
-    naive_causal_conv1d_channel_first_fwd_cpu,
-    naive_causal_conv1d_channel_first_fwd_cpu_no_bias,
-    optimized_causal_conv1d_channel_first_fwd_cpu,
-    optimized_causal_conv1d_channel_first_fwd_cpu_no_bias,
-    naive_causal_conv1d_channel_first_fwd_gpu,
-    naive_causal_conv1d_channel_first_fwd_gpu_no_bias,
+    causal_conv1d_channel_first_fwd_cpu,
+    causal_conv1d_channel_first_fwd_cpu_no_bias,
     causal_conv1d_channel_first_fwd_gpu,
     causal_conv1d_channel_first_fwd_gpu_no_bias,
     causal_conv1d_update_cpu,
@@ -10086,17 +10082,14 @@ struct Struct_sliced_add_ragged:
 # ============================================================================
 
 @compiler.register("causal_conv1d")
-struct CausalConv1D[algorithm: StaticString, activation: StaticString]:
+struct CausalConv1D[activation: StaticString]:
     """Causal 1D convolution operation with bias.
     
     Performs causal (autoregressive) 1D convolution where each output position
     depends only on current and past input positions. Supports optional SiLU
-    activation and multiple algorithm implementations.
+    activation with SIMD-vectorized implementations for widths 1, 2, 3, 4.
     
     Parameters:
-        algorithm: Kernel algorithm to use.
-            - "naive": Simple loop-based implementation, works for all widths.
-            - "optimized": SIMD-vectorized, supports widths 1, 2, 3, 4 on GPU.
         activation: Activation function to apply after convolution.
             - "none": No activation (identity).
             - "silu": SiLU/Swish activation (x * sigmoid(x)).
@@ -10106,7 +10099,6 @@ struct CausalConv1D[algorithm: StaticString, activation: StaticString]:
         - weight: (channels, width) - Convolution weights per channel.
         - bias: (channels,) - Per-channel bias to add.
         - output: (batch, channels, seqlen) - Output tensor (same shape as input).
-        - xx2D: Scratch tensor for internal use (same shape as output).
     """
     @staticmethod
     fn execute[
@@ -10115,7 +10107,6 @@ struct CausalConv1D[algorithm: StaticString, activation: StaticString]:
         target: StaticString,
     ](
         output: OutputTensor[dtype=dtype, rank=rank],
-        xx2D: OutputTensor[dtype=dtype, rank=2],
         input: FusedInputTensor[dtype=dtype, rank=rank],
         weight: InputTensor[dtype=dtype, rank=2],
         bias: InputTensor[dtype=dtype, rank=1],
@@ -10134,7 +10125,6 @@ struct CausalConv1D[algorithm: StaticString, activation: StaticString]:
         var W = weight.to_layout_tensor()
         var O = output.to_layout_tensor()
         var B = bias.to_layout_tensor()
-        var xx2Do = xx2D.to_layout_tensor()
         
         var batch_size: Int = input.dim_size(0)
         var dim: Int = input.dim_size(1)
@@ -10156,92 +10146,64 @@ struct CausalConv1D[algorithm: StaticString, activation: StaticString]:
         
         @parameter
         if is_cpu[target]():
-            @parameter
-            if Self.algorithm == "naive":
-                naive_causal_conv1d_channel_first_fwd_cpu[
-                    X.dtype,
-                    X.layout,
-                    W.dtype,
-                    W.layout,
-                    O.dtype,
-                    O.layout,
-                    B.dtype,
-                    B.layout,
-                ](
-                    batch_size,
-                    dim,
-                    seqlen,
-                    width,
-                    X,
-                    W,
-                    O,
-                    B,
-                    x_batch_stride,
-                    x_c_stride,
-                    x_l_stride,
-                    weight_c_stride,
-                    weight_width_stride,
-                    out_batch_stride,
-                    out_c_stride,
-                    out_l_stride,
-                    silu_activation,
-                )
-            elif Self.algorithm == "optimized":
-                optimized_causal_conv1d_channel_first_fwd_cpu[
-                    X.dtype,
-                    X.layout,
-                    W.dtype,
-                    W.layout,
-                    O.dtype,
-                    O.layout,
-                    B.dtype,
-                    B.layout,
-                ](
-                    batch_size,
-                    dim,
-                    seqlen,
-                    width,
-                    X,
-                    W,
-                    O,
-                    B,
-                    x_batch_stride,
-                    x_c_stride,
-                    x_l_stride,
-                    weight_c_stride,
-                    weight_width_stride,
-                    out_batch_stride,
-                    out_c_stride,
-                    out_l_stride,
-                    silu_activation,
-                )
-            else:
-                raise Error("Unsupported algorithm for CPU")
+            causal_conv1d_channel_first_fwd_cpu[
+                X.dtype,
+                X.layout,
+                W.dtype,
+                W.layout,
+                O.dtype,
+                O.layout,
+                B.dtype,
+                B.layout,
+            ](
+                batch_size,
+                dim,
+                seqlen,
+                width,
+                X,
+                W,
+                O,
+                B,
+                x_batch_stride,
+                x_c_stride,
+                x_l_stride,
+                weight_c_stride,
+                weight_width_stride,
+                out_batch_stride,
+                out_c_stride,
+                out_l_stride,
+                silu_activation,
+            )
         elif is_gpu[target]():
             var gpu_ctx: DeviceContext = ctx.get_device_context()
-            @parameter
-            if Self.algorithm == "naive":
-                comptime BX = 32
+            comptime kNThreads = 128
+            comptime kNElts = 4
+            if width == 1:
+                comptime kWidth = 1
                 var compiled_func = gpu_ctx.compile_function_checked[
-                    naive_causal_conv1d_channel_first_fwd_gpu[
+                    causal_conv1d_channel_first_fwd_gpu[
                         X.dtype,
                         X.layout,
                         W.dtype,
                         W.layout,
                         O.dtype,
                         O.layout,
-                        BX,
+                        kNThreads,
+                        kWidth,
+                        kNElts,
                         B.dtype,
                         B.layout,
                     ],
-                    naive_causal_conv1d_channel_first_fwd_gpu[
+                    causal_conv1d_channel_first_fwd_gpu[
                         X.dtype,
                         X.layout,
                         W.dtype,
                         W.layout,
                         O.dtype,
                         O.layout,
-                        BX,
+                        kNThreads,
+                        kWidth,
+                        kNElts,
                         B.dtype,
                         B.layout,
                     ],
@@ -10266,284 +10228,170 @@ struct CausalConv1D[algorithm: StaticString, activation: StaticString]:
                     out_c_stride,
                     out_l_stride,
                     silu_activation_int8,
-                    grid_dim=(batch_size, ceildiv(dim, BX), ceildiv(seqlen, BX)),
-                    block_dim=(BX),
+                    grid_dim=(ceildiv(X.dim(2), kNThreads * kNElts), X.dim(1), X.dim(0)),
+                    block_dim=(kNThreads),
                 )
-            elif Self.algorithm == "optimized":
-                comptime kNThreads = 128
-                comptime kNElts = 4
-                if width == 1:
-                    comptime kWidth = 1
-                    var compiled_func_opt = gpu_ctx.compile_function_checked[
-                        causal_conv1d_channel_first_fwd_gpu[
-                            X.dtype,
-                            X.layout,
-                            W.dtype,
-                            W.layout,
-                            O.dtype,
-                            O.layout,
-                            xx2Do.layout,
-                            kNThreads,
-                            kWidth,
-                            kNElts,
-                            B.dtype,
-                            B.layout,
-                        ],
-                        causal_conv1d_channel_first_fwd_gpu[
-                            X.dtype,
-                            X.layout,
-                            W.dtype,
-                            W.layout,
-                            O.dtype,
-                            O.layout,
-                            xx2Do.layout,
-                            kNThreads,
-                            kWidth,
-                            kNElts,
-                            B.dtype,
-                            B.layout,
-                        ],
-                    ]()
-                    var silu_activation_int8_opt = Int8(silu_activation)
-                    gpu_ctx.enqueue_function_checked(
-                        compiled_func_opt,
-                        batch_size,
-                        dim,
-                        seqlen,
-                        width,
-                        X,
-                        W,
-                        O,
-                        B,
-                        x_batch_stride,
-                        x_c_stride,
-                        x_l_stride,
-                        weight_c_stride,
-                        weight_width_stride,
-                        out_batch_stride,
-                        out_c_stride,
-                        out_l_stride,
-                        silu_activation_int8_opt,
-                        grid_dim=(ceildiv(X.dim(2), kNThreads * kNElts), X.dim(1), X.dim(0)),
-                        block_dim=(kNThreads),
-                    )
-                elif width == 2:
-                    comptime kWidth = 2
-                    var compiled_func_opt = gpu_ctx.compile_function_checked[
-                        causal_conv1d_channel_first_fwd_gpu[
-                            X.dtype,
-                            X.layout,
-                            W.dtype,
-                            W.layout,
-                            O.dtype,
-                            O.layout,
-                            xx2Do.layout,
-                            kNThreads,
-                            kWidth,
-                            kNElts,
-                            B.dtype,
-                            B.layout,
-                        ],
-                        causal_conv1d_channel_first_fwd_gpu[
-                            X.dtype,
-                            X.layout,
-                            W.dtype,
-                            W.layout,
-                            O.dtype,
-                            O.layout,
-                            xx2Do.layout,
-                            kNThreads,
-                            kWidth,
-                            kNElts,
-                            B.dtype,
-                            B.layout,
-                        ],
-                    ]()
-                    var silu_activation_int8_opt = Int8(silu_activation)
-                    gpu_ctx.enqueue_function_checked(
-                        compiled_func_opt,
-                        batch_size,
-                        dim,
-                        seqlen,
-                        width,
-                        X,
-                        W,
-                        O,
-                        B,
-                        x_batch_stride,
-                        x_c_stride,
-                        x_l_stride,
-                        weight_c_stride,
-                        weight_width_stride,
-                        out_batch_stride,
-                        out_c_stride,
-                        out_l_stride,
-                        silu_activation_int8_opt,
-                        grid_dim=(ceildiv(X.dim(2), kNThreads * kNElts), X.dim(1), X.dim(0)),
-                        block_dim=(kNThreads),
-                    )
-                elif width == 3:
-                    comptime kWidth = 3
-                    var compiled_func_opt = gpu_ctx.compile_function_checked[
-                        causal_conv1d_channel_first_fwd_gpu[
-                            X.dtype,
-                            X.layout,
-                            W.dtype,
-                            W.layout,
-                            O.dtype,
-                            O.layout,
-                            xx2Do.layout,
-                            kNThreads,
-                            kWidth,
-                            kNElts,
-                            B.dtype,
-                            B.layout,
-                        ],
-                        causal_conv1d_channel_first_fwd_gpu[
-                            X.dtype,
-                            X.layout,
-                            W.dtype,
-                            W.layout,
-                            O.dtype,
-                            O.layout,
-                            xx2Do.layout,
-                            kNThreads,
-                            kWidth,
-                            kNElts,
-                            B.dtype,
-                            B.layout,
-                        ],
-                    ]()
-                    var silu_activation_int8_opt = Int8(silu_activation)
-                    gpu_ctx.enqueue_function_checked(
-                        compiled_func_opt,
-                        batch_size,
-                        dim,
-                        seqlen,
-                        width,
-                        X,
-                        W,
-                        O,
-                        B,
-                        x_batch_stride,
-                        x_c_stride,
-                        x_l_stride,
-                        weight_c_stride,
-                        weight_width_stride,
-                        out_batch_stride,
-                        out_c_stride,
-                        out_l_stride,
-                        silu_activation_int8_opt,
-                        grid_dim=(ceildiv(X.dim(2), kNThreads * kNElts), X.dim(1), X.dim(0)),
-                        block_dim=(kNThreads),
-                    )
-                elif width == 4:
-                    comptime kWidth = 4
-                    var compiled_func_opt = gpu_ctx.compile_function_checked[
-                        causal_conv1d_channel_first_fwd_gpu[
-                            X.dtype,
-                            X.layout,
-                            W.dtype,
-                            W.layout,
-                            O.dtype,
-                            O.layout,
-                            xx2Do.layout,
-                            kNThreads,
-                            kWidth,
-                            kNElts,
-                            B.dtype,
-                            B.layout,
-                        ],
-                        causal_conv1d_channel_first_fwd_gpu[
-                            X.dtype,
-                            X.layout,
-                            W.dtype,
-                            W.layout,
-                            O.dtype,
-                            O.layout,
-                            xx2Do.layout,
-                            kNThreads,
-                            kWidth,
-                            kNElts,
-                            B.dtype,
-                            B.layout,
-                        ],
-                    ]()
-                    var silu_activation_int8_opt = Int8(silu_activation)
-                    gpu_ctx.enqueue_function_checked(
-                        compiled_func_opt,
-                        batch_size,
-                        dim,
-                        seqlen,
-                        width,
-                        X,
-                        W,
-                        O,
-                        B,
-                        x_batch_stride,
-                        x_c_stride,
-                        x_l_stride,
-                        weight_c_stride,
-                        weight_width_stride,
-                        out_batch_stride,
-                        out_c_stride,
-                        out_l_stride,
-                        silu_activation_int8_opt,
-                        grid_dim=(ceildiv(X.dim(2), kNThreads * kNElts), X.dim(1), X.dim(0)),
-                        block_dim=(kNThreads),
-                    )
-                else:
-                    # Fall back to naive for unsupported widths
-                    comptime BX = 32
-                    var compiled_func_fallback = gpu_ctx.compile_function_checked[
-                        naive_causal_conv1d_channel_first_fwd_gpu[
-                            X.dtype,
-                            X.layout,
-                            W.dtype,
-                            W.layout,
-                            O.dtype,
-                            O.layout,
-                            BX,
-                            B.dtype,
-                            B.layout,
-                        ],
-                        naive_causal_conv1d_channel_first_fwd_gpu[
-                            X.dtype,
-                            X.layout,
-                            W.dtype,
-                            W.layout,
-                            O.dtype,
-                            O.layout,
-                            BX,
-                            B.dtype,
-                            B.layout,
-                        ],
-                    ]()
-                    var silu_activation_int8_fallback = Int8(silu_activation)
-                    gpu_ctx.enqueue_function_checked(
-                        compiled_func_fallback,
-                        batch_size,
-                        dim,
-                        seqlen,
-                        width,
-                        X,
-                        W,
-                        O,
-                        B,
-                        x_batch_stride,
-                        x_c_stride,
-                        x_l_stride,
-                        weight_c_stride,
-                        weight_width_stride,
-                        out_batch_stride,
-                        out_c_stride,
-                        out_l_stride,
-                        silu_activation_int8_fallback,
-                        grid_dim=(batch_size, ceildiv(dim, BX), ceildiv(seqlen, BX)),
-                        block_dim=(BX),
-                    )
+            elif width == 2:
+                comptime kWidth = 2
+                var compiled_func = gpu_ctx.compile_function_checked[
+                    causal_conv1d_channel_first_fwd_gpu[
+                        X.dtype,
+                        X.layout,
+                        W.dtype,
+                        W.layout,
+                        O.dtype,
+                        O.layout,
+                        kNThreads,
+                        kWidth,
+                        kNElts,
+                        B.dtype,
+                        B.layout,
+                    ],
+                    causal_conv1d_channel_first_fwd_gpu[
+                        X.dtype,
+                        X.layout,
+                        W.dtype,
+                        W.layout,
+                        O.dtype,
+                        O.layout,
+                        kNThreads,
+                        kWidth,
+                        kNElts,
+                        B.dtype,
+                        B.layout,
+                    ],
+                ]()
+                var silu_activation_int8 = Int8(silu_activation)
+                gpu_ctx.enqueue_function_checked(
+                    compiled_func,
+                    batch_size,
+                    dim,
+                    seqlen,
+                    width,
+                    X,
+                    W,
+                    O,
+                    B,
+                    x_batch_stride,
+                    x_c_stride,
+                    x_l_stride,
+                    weight_c_stride,
+                    weight_width_stride,
+                    out_batch_stride,
+                    out_c_stride,
+                    out_l_stride,
+                    silu_activation_int8,
+                    grid_dim=(ceildiv(X.dim(2), kNThreads * kNElts), X.dim(1), X.dim(0)),
+                    block_dim=(kNThreads),
+                )
+            elif width == 3:
+                comptime kWidth = 3
+                var compiled_func = gpu_ctx.compile_function_checked[
+                    causal_conv1d_channel_first_fwd_gpu[
+                        X.dtype,
+                        X.layout,
+                        W.dtype,
+                        W.layout,
+                        O.dtype,
+                        O.layout,
+                        kNThreads,
+                        kWidth,
+                        kNElts,
+                        B.dtype,
+                        B.layout,
+                    ],
+                    causal_conv1d_channel_first_fwd_gpu[
+                        X.dtype,
+                        X.layout,
+                        W.dtype,
+                        W.layout,
+                        O.dtype,
+                        O.layout,
+                        kNThreads,
+                        kWidth,
+                        kNElts,
+                        B.dtype,
+                        B.layout,
+                    ],
+                ]()
+                var silu_activation_int8 = Int8(silu_activation)
+                gpu_ctx.enqueue_function_checked(
+                    compiled_func,
+                    batch_size,
+                    dim,
+                    seqlen,
+                    width,
+                    X,
+                    W,
+                    O,
+                    B,
+                    x_batch_stride,
+                    x_c_stride,
+                    x_l_stride,
+                    weight_c_stride,
+                    weight_width_stride,
+                    out_batch_stride,
+                    out_c_stride,
+                    out_l_stride,
+                    silu_activation_int8,
+                    grid_dim=(ceildiv(X.dim(2), kNThreads * kNElts), X.dim(1), X.dim(0)),
+                    block_dim=(kNThreads),
+                )
+            elif width == 4:
+                comptime kWidth = 4
+                var compiled_func = gpu_ctx.compile_function_checked[
+                    causal_conv1d_channel_first_fwd_gpu[
+                        X.dtype,
+                        X.layout,
+                        W.dtype,
+                        W.layout,
+                        O.dtype,
+                        O.layout,
+                        kNThreads,
+                        kWidth,
+                        kNElts,
+                        B.dtype,
+                        B.layout,
+                    ],
+                    causal_conv1d_channel_first_fwd_gpu[
+                        X.dtype,
+                        X.layout,
+                        W.dtype,
+                        W.layout,
+                        O.dtype,
+                        O.layout,
+                        kNThreads,
+                        kWidth,
+                        kNElts,
+                        B.dtype,
+                        B.layout,
+                    ],
+                ]()
+                var silu_activation_int8 = Int8(silu_activation)
+                gpu_ctx.enqueue_function_checked(
+                    compiled_func,
+                    batch_size,
+                    dim,
+                    seqlen,
+                    width,
+                    X,
+                    W,
+                    O,
+                    B,
+                    x_batch_stride,
+                    x_c_stride,
+                    x_l_stride,
+                    weight_c_stride,
+                    weight_width_stride,
+                    out_batch_stride,
+                    out_c_stride,
+                    out_l_stride,
+                    silu_activation_int8,
+                    grid_dim=(ceildiv(X.dim(2), kNThreads * kNElts), X.dim(1), X.dim(0)),
+                    block_dim=(kNThreads),
+                )
             else:
-                raise Error("Unsupported algorithm for GPU")
+                raise Error("Unsupported kernel width: only widths 1, 2, 3, 4 are supported")
         else:
             raise Error("Unsupported target device")
     

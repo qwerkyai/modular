@@ -196,13 +196,38 @@ class MambaConfig(MAXModelConfig, MambaConfigBase):
         if x_proj_key in state_dict:
             weight_data = state_dict[x_proj_key]
             if weight_data is not None and hasattr(weight_data, "shape"):
-                # x_proj weight shape is [out_dim, in_dim]
+                # x_proj weight shape: PyTorch Linear layers use [out_features, in_features]
+                # MAX Linear layers also use [out_dim, in_dim]
                 # Convert Dim to int if needed - handle both Dim and int
                 shape_0 = weight_data.shape[0]
+                shape_1 = weight_data.shape[1] if len(weight_data.shape) > 1 else None
                 if hasattr(shape_0, 'value'):
-                    x_proj_dim = int(shape_0.value)
+                    dim_0 = int(shape_0.value)
+                    dim_1 = int(shape_1.value) if shape_1 is not None and hasattr(shape_1, 'value') else None
                 else:
-                    x_proj_dim = int(shape_0)
+                    dim_0 = int(shape_0)
+                    dim_1 = int(shape_1) if shape_1 is not None else None
+                
+                # Determine which dimension is the output (x_proj_dim)
+                # Standard: [out_dim, in_dim] where in_dim should match intermediate_size
+                # Check both possibilities and use the one that makes sense
+                if dim_1 == intermediate_size:
+                    # Standard case: shape[0] is out_dim, shape[1] is in_dim
+                    x_proj_dim = dim_0
+                elif dim_0 == intermediate_size:
+                    # Transposed case: shape[1] is out_dim, shape[0] is in_dim
+                    x_proj_dim = dim_1 if dim_1 is not None else dim_0
+                    logger.warning(
+                        f"x_proj weight appears transposed: using shape[1]={x_proj_dim} "
+                        f"as output dimension (shape[0]={dim_0} matches intermediate_size={intermediate_size})"
+                    )
+                else:
+                    # Neither matches - use shape[0] as default and warn
+                    x_proj_dim = dim_0
+                    logger.warning(
+                        f"x_proj weight shape unclear: shape={weight_data.shape}, "
+                        f"intermediate_size={intermediate_size}. Using shape[0]={x_proj_dim} as x_proj_dim."
+                    )
                 
                 # Try to infer dt_rank from x_proj_dim
                 # x_proj projects to dt_rank + 2 * n_groups * d_state

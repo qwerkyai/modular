@@ -25,25 +25,16 @@ Causal Convolution:
 
 Kernel Categories:
 
-    1. Naive Implementations (CPU & GPU):
-        - `naive_causal_conv1d_channel_first_fwd_cpu[_no_bias]`
-        - `naive_causal_conv1d_channel_last_fwd_cpu[_with_seq_idx][_no_bias]`
-        - `naive_causal_conv1d_channel_first_fwd_gpu[_no_bias]`
-        - `naive_causal_conv1d_channel_last_fwd_gpu[_with_seq_idx][_no_bias]`
-        
-        These are straightforward loop-based implementations that work for any
-        kernel width. Good for correctness verification and fallback.
-    
-    2. Optimized Implementations (CPU & GPU):
-        - `optimized_causal_conv1d_channel_first_fwd_cpu[_no_bias]`
-        - `optimized_causal_conv1d_channel_last_fwd_cpu[_with_seq_idx][_no_bias]`
+    1. Forward Kernels (CPU & GPU):
+        - `causal_conv1d_channel_first_fwd_cpu[_no_bias]`
+        - `causal_conv1d_channel_last_fwd_cpu[_with_seq_idx][_no_bias]`
         - `causal_conv1d_channel_first_fwd_gpu[_with_seq_idx][_no_bias]`
         - `causal_conv1d_channel_last_fwd_gpu[_with_seq_idx][_no_bias]`
         
         SIMD-vectorized implementations with compile-time width specialization.
-        Supported widths: 1, 2, 3, 4 (falls back to naive for unsupported widths).
+        Supported widths: 1, 2, 3, 4.
     
-    3. Update Kernels (for autoregressive decode):
+    2. Update Kernels (for autoregressive decode):
         - `causal_conv1d_update_cpu[_no_bias]`
         - `causal_conv1d_update_gpu[_no_bias]`
         
@@ -79,284 +70,11 @@ from utils.numerics import get_accum_type
 
 
 # ===----------------------------------------------------------------------=== #
-# Naive CPU Implementations
+# CPU Implementations
 # ===----------------------------------------------------------------------=== #
 
 
-fn naive_causal_conv1d_channel_last_fwd_cpu[
-    x_dtype: DType,
-    x_layout: Layout,
-    weight_dtype: DType,
-    weight_layout: Layout,
-    output_dtype: DType,
-    output_layout: Layout,
-    bias_ptr_type: DType,
-](
-    batch: Int,
-    dim: Int,
-    seqlen: Int,
-    width: Int,
-
-    x: LayoutTensor[x_dtype, x_layout, MutAnyOrigin], # Shape (B, L, C)
-    weight: LayoutTensor[weight_dtype, weight_layout, MutAnyOrigin], # Shape (C, W)
-    mut output: LayoutTensor[output_dtype, output_layout, MutAnyOrigin], # Shape (B, L, C)
-
-    bias_ptr: LegacyUnsafePointer[Scalar[bias_ptr_type]], # Shape (C), stride = 1
-    seq_idx_ptr: LegacyUnsafePointer[Int],
-    mut final_states_ptr: LegacyUnsafePointer[Scalar[output_dtype]], # Shape (B, W-1, L)
-    initial_states_ptr: LegacyUnsafePointer[Scalar[x.dtype]],
-
-    x_batch_stride: UInt32,
-    x_c_stride: UInt32,
-    x_l_stride: UInt32,
-
-    weight_c_stride: UInt32,
-    weight_width_stride: UInt32,
-
-    out_batch_stride: UInt32,
-    out_c_stride: UInt32,
-    out_l_stride: UInt32,
-
-    initial_states_batch_stride: UInt32,
-    initial_states_c_stride: UInt32,
-    initial_states_l_stride: UInt32,
-
-    final_states_batch_stride: UInt32,
-    final_states_c_stride: UInt32,
-    final_states_l_stride: UInt32,
-
-    silu_activation: Bool,
-):
-    """Naive implementation of causal conv1d for channel last data layout.
-
-    Parameters:
-        x_dtype: Data type of the input tensor.
-        x_layout: Layout of the input tensor.
-        weight_dtype: Data type of the weight tensor.
-        weight_layout: Layout of the weight tensor.
-        output_dtype: Data type of the output tensor.
-        output_layout: Layout of the output tensor.
-
-    Args:
-        batch: Batch size.
-        dim: Number of channels.
-        seqlen: Sequence length.
-        width: Kernel width.
-        x: Input tensor.
-        weight: Weight tensor.
-        output: Output tensor.
-        bias_ptr: Pointer to the bias tensor.
-        seq_idx_ptr: Pointer to the sequence index tensor.
-        final_states_ptr: Pointer to the final states tensor.
-        initial_states_ptr: Pointer to the initial states tensor.
-        x_batch_stride: Stride for the batch dimension of the input tensor.
-        x_c_stride: Stride for the channel dimension of the input tensor.
-        x_l_stride: Stride for the sequence length dimension of the input tensor.
-        weight_c_stride: Stride for the channel dimension of the weight tensor.
-        weight_width_stride: Stride for the width dimension of the weight tensor.
-        out_batch_stride: Stride for the batch dimension of the output tensor.
-        out_c_stride: Stride for the channel dimension of the output tensor.
-        out_l_stride: Stride for the sequence length dimension of the output tensor.
-        initial_states_batch_stride: Stride for the batch dimension of the initial states.
-        initial_states_c_stride: Stride for the channel dimension of the initial states.
-        initial_states_l_stride: Stride for the sequence length dimension of the initial states.
-        final_states_batch_stride: Stride for the batch dimension of the final states.
-        final_states_c_stride: Stride for the channel dimension of the final states.
-        final_states_l_stride: Stride for the sequence length dimension of the final states.
-        silu_activation: Whether to apply SiLU activation.
-
-
-    """
-
-    var width_minus_1: Int = width - 1
-    
-    # TODO: Implement final_states_ptr functionality when needed
-    # For now, skip final_states_ptr handling to avoid compilation issues with optional pointers
-    
-    var seq_idx_l_stride: Int = 1
-    var seq_idx_batch_stride: Int = seqlen
-
-    for b in range(batch):
-        for l in range(seqlen):
-            var cur_seq_idx: Int32 = 0
-            # TODO: Implement seq_idx_ptr handling when needed
-            # For now, treat all positions as belonging to the same sequence
-            
-            for c in range(dim):
-                var conv_sum: Scalar[output.dtype] = 0.0
-                for w in range(width):
-                    var input_l: Int = l - (width_minus_1 - w)
-                    var valid_seq: Bool = True
-                    # TODO: Implement seq_idx validation when seq_idx_ptr is available
-                    
-                    if valid_seq and input_l >= 0:
-                        var x_offset: UInt32 = b * x_batch_stride + input_l * x_l_stride + c * x_c_stride
-                        var input_val: Scalar[x.dtype] = x.ptr.offset(x_offset).load()
-                        var weight_offset: UInt32 = c * weight_c_stride + w * weight_width_stride
-                        var weight_val: Scalar[weight.dtype] = weight.ptr.offset(weight_offset).load()
-                        conv_sum = conv_sum + Scalar[output.dtype](input_val * Scalar[x.dtype](weight_val))
-                
-                # TODO: Implement bias_ptr handling when needed
-                # For now, assume no bias (bias_ptr is optional)
-                
-                var out_offset: UInt32 = b * out_batch_stride + l * out_l_stride + c * out_c_stride
-                var out_val: Scalar[output.dtype] = conv_sum
-                if silu_activation:
-                    out_val = out_val / (1 + exp(-out_val))
-                output.ptr.offset(out_offset).store(out_val)
-
-
-# Naive CPU implementation for channel-last with bias and seq_idx as LayoutTensor
-fn naive_causal_conv1d_channel_last_fwd_cpu_with_seq_idx[
-    x_dtype: DType,
-    x_layout: Layout,
-    weight_dtype: DType,
-    weight_layout: Layout,
-    output_dtype: DType,
-    output_layout: Layout,
-    bias_dtype: DType,
-    bias_layout: Layout,
-    seq_idx_dtype: DType,
-    seq_idx_layout: Layout,
-](
-    batch: Int,
-    dim: Int,
-    seqlen: Int,
-    width: Int,
-
-    x: LayoutTensor[x_dtype, x_layout, MutAnyOrigin], # Shape (B, L, C)
-    weight: LayoutTensor[weight_dtype, weight_layout, MutAnyOrigin], # Shape (C, W)
-    mut output: LayoutTensor[output_dtype, output_layout, MutAnyOrigin], # Shape (B, L, C)
-    bias: LayoutTensor[bias_dtype, bias_layout, MutAnyOrigin], # Shape (C,)
-    seq_idx: LayoutTensor[seq_idx_dtype, seq_idx_layout, MutAnyOrigin], # Shape (B, L)
-
-    x_batch_stride: UInt32,
-    x_c_stride: UInt32,
-    x_l_stride: UInt32,
-
-    weight_c_stride: UInt32,
-    weight_width_stride: UInt32,
-
-    out_batch_stride: UInt32,
-    out_c_stride: UInt32,
-    out_l_stride: UInt32,
-
-    seq_idx_batch_stride: UInt32,
-    seq_idx_l_stride: UInt32,
-
-    silu_activation: Bool,
-):
-    """Naive implementation of causal conv1d for channel last data layout with seq_idx."""
-    var width_minus_1: Int = width - 1
-
-    for b in range(batch):
-        for l in range(seqlen):
-            var seq_idx_offset: UInt32 = b * seq_idx_batch_stride + l * seq_idx_l_stride
-            var cur_seq_idx_val = seq_idx.ptr.offset(seq_idx_offset).load()
-            var cur_seq_idx: Int32 = Int32(cur_seq_idx_val)
-            
-            for c in range(dim):
-                var conv_sum: Scalar[output_dtype] = Scalar[output_dtype](bias.ptr.offset(c).load())
-                
-                for w in range(width):
-                    var input_l: Int = l - (width_minus_1 - w)
-                    var valid_seq: Bool = True
-                    if input_l >= 0:
-                        var input_seq_idx_offset: UInt32 = b * seq_idx_batch_stride + input_l * seq_idx_l_stride
-                        var input_seq_idx_val = seq_idx.ptr.offset(input_seq_idx_offset).load()
-                        var input_seq_idx: Int32 = Int32(input_seq_idx_val)
-                        if input_seq_idx != cur_seq_idx:
-                            valid_seq = False
-                    
-                    if valid_seq and input_l >= 0:
-                        var x_offset: UInt32 = b * x_batch_stride + input_l * x_l_stride + c * x_c_stride
-                        var input_val: Scalar[x_dtype] = x.ptr.offset(x_offset).load()
-                        var weight_offset: UInt32 = c * weight_c_stride + w * weight_width_stride
-                        var weight_val: Scalar[weight_dtype] = weight.ptr.offset(weight_offset).load()
-                        conv_sum = conv_sum + Scalar[output_dtype](input_val * Scalar[x_dtype](weight_val))
-                
-                var out_offset: UInt32 = b * out_batch_stride + l * out_l_stride + c * out_c_stride
-                var out_val: Scalar[output_dtype] = conv_sum
-                if silu_activation:
-                    out_val = out_val / (1 + exp(-out_val))
-                output.ptr.offset(out_offset).store(out_val)
-
-
-# Naive CPU implementation for channel-last without bias but with seq_idx as LayoutTensor
-fn naive_causal_conv1d_channel_last_fwd_cpu_no_bias_with_seq_idx[
-    x_dtype: DType,
-    x_layout: Layout,
-    weight_dtype: DType,
-    weight_layout: Layout,
-    output_dtype: DType,
-    output_layout: Layout,
-    seq_idx_dtype: DType,
-    seq_idx_layout: Layout,
-](
-    batch: Int,
-    dim: Int,
-    seqlen: Int,
-    width: Int,
-
-    x: LayoutTensor[x_dtype, x_layout, MutAnyOrigin], # Shape (B, L, C)
-    weight: LayoutTensor[weight_dtype, weight_layout, MutAnyOrigin], # Shape (C, W)
-    mut output: LayoutTensor[output_dtype, output_layout, MutAnyOrigin], # Shape (B, L, C)
-    seq_idx: LayoutTensor[seq_idx_dtype, seq_idx_layout, MutAnyOrigin], # Shape (B, L)
-
-    x_batch_stride: UInt32,
-    x_c_stride: UInt32,
-    x_l_stride: UInt32,
-
-    weight_c_stride: UInt32,
-    weight_width_stride: UInt32,
-
-    out_batch_stride: UInt32,
-    out_c_stride: UInt32,
-    out_l_stride: UInt32,
-
-    seq_idx_batch_stride: UInt32,
-    seq_idx_l_stride: UInt32,
-
-    silu_activation: Bool,
-):
-    """Naive implementation of causal conv1d for channel last data layout without bias but with seq_idx."""
-    var width_minus_1: Int = width - 1
-
-    for b in range(batch):
-        for l in range(seqlen):
-            var seq_idx_offset: UInt32 = b * seq_idx_batch_stride + l * seq_idx_l_stride
-            var cur_seq_idx_val = seq_idx.ptr.offset(seq_idx_offset).load()
-            var cur_seq_idx: Int32 = Int32(cur_seq_idx_val)
-            
-            for c in range(dim):
-                var conv_sum: Scalar[output_dtype] = 0.0
-                
-                for w in range(width):
-                    var input_l: Int = l - (width_minus_1 - w)
-                    var valid_seq: Bool = True
-                    if input_l >= 0:
-                        var input_seq_idx_offset: UInt32 = b * seq_idx_batch_stride + input_l * seq_idx_l_stride
-                        var input_seq_idx_val = seq_idx.ptr.offset(input_seq_idx_offset).load()
-                        var input_seq_idx: Int32 = Int32(input_seq_idx_val)
-                        if input_seq_idx != cur_seq_idx:
-                            valid_seq = False
-                    
-                    if valid_seq and input_l >= 0:
-                        var x_offset: UInt32 = b * x_batch_stride + input_l * x_l_stride + c * x_c_stride
-                        var input_val: Scalar[x_dtype] = x.ptr.offset(x_offset).load()
-                        var weight_offset: UInt32 = c * weight_c_stride + w * weight_width_stride
-                        var weight_val: Scalar[weight_dtype] = weight.ptr.offset(weight_offset).load()
-                        conv_sum = conv_sum + Scalar[output_dtype](input_val * Scalar[x_dtype](weight_val))
-                
-                var out_offset: UInt32 = b * out_batch_stride + l * out_l_stride + c * out_c_stride
-                var out_val: Scalar[output_dtype] = conv_sum
-                if silu_activation:
-                    out_val = out_val / (1 + exp(-out_val))
-                output.ptr.offset(out_offset).store(out_val)
-
-                
-# Version with bias tensor
-fn naive_causal_conv1d_channel_first_fwd_cpu[
+fn causal_conv1d_channel_first_fwd_cpu[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -390,178 +108,11 @@ fn naive_causal_conv1d_channel_first_fwd_cpu[
 
     silu_activation: Bool,
 ):
-    """Naive CPU implementation of causal conv1d for channel-first layout with bias.
-    
-    This is a straightforward loop-based implementation that works for any kernel width.
-    Good for correctness verification and fallback.
-    
-    Args:
-        batch: Batch size.
-        dim: Number of channels.
-        seqlen: Sequence length.
-        width: Kernel width.
-        x: Input tensor of shape (B, C, L).
-        weight: Weight tensor of shape (C, W).
-        output: Output tensor of shape (B, C, L).
-        bias: Bias tensor of shape (C,).
-        x_batch_stride: Stride for the batch dimension of the input tensor.
-        x_c_stride: Stride for the channel dimension of the input tensor.
-        x_l_stride: Stride for the sequence length dimension of the input tensor.
-        weight_c_stride: Stride for the channel dimension of the weight tensor.
-        weight_width_stride: Stride for the width dimension of the weight tensor.
-        out_batch_stride: Stride for the batch dimension of the output tensor.
-        out_c_stride: Stride for the channel dimension of the output tensor.
-        out_l_stride: Stride for the sequence length dimension of the output tensor.
-        silu_activation: Whether to apply SiLU activation.
-    """
-    var width_minus_1: Int = width - 1
-
-    for b in range(batch):
-        for c in range(dim):
-            var weight_c_base_offset: UInt32 = c * weight_c_stride
-            var cur_bias: Scalar[output_dtype] = Scalar[output_dtype](bias.ptr.offset(c).load())
-            for l in range(seqlen):
-                var conv_sum: Scalar[output_dtype] = cur_bias
-                for w in range(width):
-                    var input_l: Int = l - (width_minus_1 - w)
-                    if input_l >= 0:
-                        var x_offset: UInt32 = b * x_batch_stride + c * x_c_stride + input_l * x_l_stride
-                        var input_val: Scalar[x.dtype] = x.ptr.offset(x_offset).load()
-                        var weight_offset: UInt32 = weight_c_base_offset + w * weight_width_stride
-                        var weight_val: Scalar[weight.dtype] = weight.ptr.offset(weight_offset).load()
-                        conv_sum = conv_sum + Scalar[output_dtype](input_val * Scalar[x.dtype](weight_val))
-                
-                var out_offset: UInt32 = b * out_batch_stride + c * out_c_stride + l * out_l_stride
-                var out_val: Scalar[output_dtype] = conv_sum
-                if silu_activation:
-                    out_val = out_val / (1 + exp(-out_val))
-                output.ptr.offset(out_offset).store(out_val)
-
-# ===----------------------------------------------------------------------=== #
-
-
-fn naive_causal_conv1d_channel_first_fwd_cpu_no_bias[
-    x_dtype: DType,
-    x_layout: Layout,
-    weight_dtype: DType,
-    weight_layout: Layout,
-    output_dtype: DType,
-    output_layout: Layout,
-](
-    batch: Int,
-    dim: Int,
-    seqlen: Int,
-    width: Int,
-
-    x: LayoutTensor[x_dtype, x_layout, MutAnyOrigin], # Shape (B, C, L)
-    weight: LayoutTensor[weight_dtype, weight_layout, MutAnyOrigin], # Shape (C, W)
-    mut output: LayoutTensor[output_dtype, output_layout, MutAnyOrigin], # Shape (B, C, L)
-
-    x_batch_stride: UInt32,
-    x_c_stride: UInt32,
-    x_l_stride: UInt32,
-
-    weight_c_stride: UInt32,
-    weight_width_stride: UInt32,
-
-    out_batch_stride: UInt32,
-    out_c_stride: UInt32,
-    out_l_stride: UInt32,
-
-    silu_activation: Bool,
-):
-    """Naive CPU implementation of causal conv1d for channel-first layout without bias.
-    
-    This is a straightforward loop-based implementation that works for any kernel width.
-    Good for correctness verification and fallback.
-    
-    Args:
-        batch: Batch size.
-        dim: Number of channels.
-        seqlen: Sequence length.
-        width: Kernel width.
-        x: Input tensor of shape (B, C, L).
-        weight: Weight tensor of shape (C, W).
-        output: Output tensor of shape (B, C, L).
-        x_batch_stride: Stride for the batch dimension of the input tensor.
-        x_c_stride: Stride for the channel dimension of the input tensor.
-        x_l_stride: Stride for the sequence length dimension of the input tensor.
-        weight_c_stride: Stride for the channel dimension of the weight tensor.
-        weight_width_stride: Stride for the width dimension of the weight tensor.
-        out_batch_stride: Stride for the batch dimension of the output tensor.
-        out_c_stride: Stride for the channel dimension of the output tensor.
-        out_l_stride: Stride for the sequence length dimension of the output tensor.
-        silu_activation: Whether to apply SiLU activation.
-    """
-    var width_minus_1: Int = width - 1
-
-    for b in range(batch):
-        for c in range(dim):
-            var weight_c_base_offset: UInt32 = c * weight_c_stride
-            for l in range(seqlen):
-                var conv_sum: Scalar[output_dtype] = 0.0
-                for w in range(width):
-                    var input_l: Int = l - (width_minus_1 - w)
-                    if input_l >= 0:
-                        var x_offset: UInt32 = b * x_batch_stride + c * x_c_stride + input_l * x_l_stride
-                        var input_val: Scalar[x.dtype] = x.ptr.offset(x_offset).load()
-                        var weight_offset: UInt32 = weight_c_base_offset + w * weight_width_stride
-                        var weight_val: Scalar[weight.dtype] = weight.ptr.offset(weight_offset).load()
-                        conv_sum = conv_sum + Scalar[output_dtype](input_val * Scalar[x.dtype](weight_val))
-                
-                var out_offset: UInt32 = b * out_batch_stride + c * out_c_stride + l * out_l_stride
-                var out_val: Scalar[output_dtype] = conv_sum
-                if silu_activation:
-                    out_val = out_val / (1 + exp(-out_val))
-                output.ptr.offset(out_offset).store(out_val)
-
-
-# ===----------------------------------------------------------------------=== #
-# Optimized CPU Implementations
-# ===----------------------------------------------------------------------=== #
-
-
-fn optimized_causal_conv1d_channel_first_fwd_cpu[
-    x_dtype: DType,
-    x_layout: Layout,
-    weight_dtype: DType,
-    weight_layout: Layout,
-    output_dtype: DType,
-    output_layout: Layout,
-    bias_dtype: DType,
-    bias_layout: Layout,
-](
-    batch: Int,
-    dim: Int,
-    seqlen: Int,
-    width: Int,
-
-    x: LayoutTensor[x_dtype, x_layout, MutAnyOrigin], # Shape (B, C, L)
-    weight: LayoutTensor[weight_dtype, weight_layout, MutAnyOrigin], # Shape (C, W)
-    mut output: LayoutTensor[output_dtype, output_layout, MutAnyOrigin], # Shape (B, C, L)
-
-    bias: LayoutTensor[bias_dtype, bias_layout, MutAnyOrigin], # Shape (C,), stride = 1
-
-    x_batch_stride: UInt32,
-    x_c_stride: UInt32,
-    x_l_stride: UInt32,
-
-    weight_c_stride: UInt32,
-    weight_width_stride: UInt32,
-
-    out_batch_stride: UInt32,
-    out_c_stride: UInt32,
-    out_l_stride: UInt32,
-
-    silu_activation: Bool,
-):
-    """Optimized CPU implementation of causal conv1d for channel-first layout with bias.
+    """CPU implementation of causal conv1d for channel-first layout with bias.
     
     Optimizations:
     1. Parallelization across batch*channel dimensions using sync_parallelize.
     2. Pre-loaded weights in registers to reduce memory access.
-    3. Scalar implementation (SIMD not applicable due to causal structure requiring
-       different offsets for each weight).
     
     Args:
         batch: Batch size.
@@ -636,10 +187,7 @@ fn optimized_causal_conv1d_channel_first_fwd_cpu[
     sync_parallelize[process_bc](total_bc)
 
 
-# ===----------------------------------------------------------------------=== #
-
-
-fn optimized_causal_conv1d_channel_first_fwd_cpu_no_bias[
+fn causal_conv1d_channel_first_fwd_cpu_no_bias[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -669,13 +217,11 @@ fn optimized_causal_conv1d_channel_first_fwd_cpu_no_bias[
 
     silu_activation: Bool,
 ):
-    """Optimized CPU implementation of causal conv1d for channel-first layout without bias.
+    """CPU implementation of causal conv1d for channel-first layout without bias.
     
     Optimizations:
     1. Parallelization across batch*channel dimensions using sync_parallelize.
     2. Pre-loaded weights in registers to reduce memory access.
-    3. Scalar implementation (SIMD not applicable due to causal structure requiring
-       different offsets for each weight).
     
     Args:
         batch: Batch size.
@@ -748,8 +294,7 @@ fn optimized_causal_conv1d_channel_first_fwd_cpu_no_bias[
     sync_parallelize[process_bc](total_bc)
 
 
-# SIMD-optimized CPU implementation for channel-last with bias
-fn optimized_causal_conv1d_channel_last_fwd_cpu[
+fn causal_conv1d_channel_last_fwd_cpu[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -812,8 +357,7 @@ fn optimized_causal_conv1d_channel_last_fwd_cpu[
                 output.ptr.offset(out_offset).store(out_val)
 
 
-# SIMD-optimized CPU implementation for channel-last without bias
-fn optimized_causal_conv1d_channel_last_fwd_cpu_no_bias[
+fn causal_conv1d_channel_last_fwd_cpu_no_bias[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -872,8 +416,7 @@ fn optimized_causal_conv1d_channel_last_fwd_cpu_no_bias[
                 output.ptr.offset(out_offset).store(out_val)
 
 
-# SIMD-optimized CPU implementation for channel-last with bias and seq_idx as LayoutTensor
-fn optimized_causal_conv1d_channel_last_fwd_cpu_with_seq_idx[
+fn causal_conv1d_channel_last_fwd_cpu_with_seq_idx[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -948,8 +491,7 @@ fn optimized_causal_conv1d_channel_last_fwd_cpu_with_seq_idx[
                 output.ptr.offset(out_offset).store(out_val)
 
 
-# SIMD-optimized CPU implementation for channel-last without bias but with seq_idx as LayoutTensor
-fn optimized_causal_conv1d_channel_last_fwd_cpu_no_bias_with_seq_idx[
+fn causal_conv1d_channel_last_fwd_cpu_no_bias_with_seq_idx[
     x_dtype: DType,
     x_layout: Layout,
     weight_dtype: DType,
@@ -1022,361 +564,7 @@ fn optimized_causal_conv1d_channel_last_fwd_cpu_no_bias_with_seq_idx[
 
 
 # ===----------------------------------------------------------------------=== #
-# Naive GPU Implementations
-# ===----------------------------------------------------------------------=== #
-
-
-fn naive_causal_conv1d_channel_first_fwd_gpu[
-    x_dtype: DType,
-    x_layout: Layout,
-    weight_dtype: DType,
-    weight_layout: Layout,
-    output_dtype: DType,
-    output_layout: Layout,
-    BX: Int,
-    bias_dtype: DType,
-    bias_layout: Layout,
-](
-    batch: Int,
-    dim: Int,
-    seqlen: Int,
-    width: Int,
-
-    x: LayoutTensor[x_dtype, x_layout, MutAnyOrigin], # Shape (B, C, L)
-    weight: LayoutTensor[weight_dtype, weight_layout, MutAnyOrigin], # Shape (C, W)
-    output: LayoutTensor[output_dtype, output_layout, MutAnyOrigin], # Shape (B, C, L)
-
-    bias: LayoutTensor[bias_dtype, bias_layout, MutAnyOrigin], # Shape (C,), stride = 1
-
-    x_batch_stride: UInt32,
-    x_c_stride: UInt32,
-    x_l_stride: UInt32,
-
-    weight_c_stride: UInt32,
-    weight_width_stride: UInt32,
-
-    out_batch_stride: UInt32,
-    out_c_stride: UInt32,
-    out_l_stride: UInt32,
-
-    silu_activation: Int8,
-):
-    """Naive GPU implementation of causal conv1d for channel-first layout with bias.
-    
-    This is a straightforward loop-based implementation that works for any kernel width.
-    Good for correctness verification and fallback.
-    
-    Note: silu_activation is Int8 (0 or 1) instead of Bool for DevicePassable compatibility.
-    
-    Grid: (ceildiv(batch, 1), ceildiv(dim, BX), ceildiv(seqlen, BX))
-    Block: BX
-    
-    Args:
-        batch: Batch size.
-        dim: Number of channels.
-        seqlen: Sequence length.
-        width: Kernel width.
-        x: Input tensor of shape (B, C, L).
-        weight: Weight tensor of shape (C, W).
-        output: Output tensor of shape (B, C, L).
-        bias: Bias tensor of shape (C,).
-        x_batch_stride: Stride for the batch dimension of the input tensor.
-        x_c_stride: Stride for the channel dimension of the input tensor.
-        x_l_stride: Stride for the sequence length dimension of the input tensor.
-        weight_c_stride: Stride for the channel dimension of the weight tensor.
-        weight_width_stride: Stride for the width dimension of the weight tensor.
-        out_batch_stride: Stride for the batch dimension of the output tensor.
-        out_c_stride: Stride for the channel dimension of the output tensor.
-        out_l_stride: Stride for the sequence length dimension of the output tensor.
-        silu_activation: Whether to apply SiLU activation (Int8: 0 or 1).
-    """
-
-    var B = x.dim(0)
-    var C = x.dim(1)
-    var L = x.dim(2)
-    var W = weight.dim(1)
-    var width_minus_1: Int = W - 1
-
-    var batch_idx = block_idx.x
-    var channel_idx = block_idx.y
-    var seqlen_idx = block_idx.z
-    var tid = thread_idx.x
-
-    var b: Int = Int(batch_idx)
-    var c: Int = Int(channel_idx) * Int(BX) + Int(tid)
-    var l_start: Int = Int(seqlen_idx) * Int(BX)
-    var l_end: Int = min(l_start + Int(BX), L)
-    
-    if c >= C or b >= B or l_start >= L:
-        return
-
-    var cur_bias: Scalar[output_dtype] = Scalar[output_dtype](bias.ptr.offset(c).load())
-    var weight_c_base_offset: UInt32 = c * weight_c_stride
-    var silu_active = Bool(Int(silu_activation) != 0)
-
-    for l in range(l_start, l_end):
-        var conv_sum: Scalar[output.dtype] = cur_bias
-        for w in range(W):
-            var input_l: Int = l - (width_minus_1 - w)
-            if input_l >= 0:
-                var x_offset: UInt32 = b * x_batch_stride + c * x_c_stride + input_l * x_l_stride
-                var input_val: Scalar[x.dtype] = x.ptr.offset(x_offset).load()
-                var weight_offset: UInt32 = weight_c_base_offset + w * weight_width_stride
-                var weight_val: Scalar[weight.dtype] = weight.ptr.offset(weight_offset).load()
-                conv_sum = conv_sum + Scalar[output_dtype](input_val * Scalar[x.dtype](weight_val))
-        
-        var out_offset: UInt32 = b * out_batch_stride + c * out_c_stride + l * out_l_stride
-        var out_val: Scalar[output.dtype] = conv_sum
-        if silu_active:
-            out_val = out_val / (1 + exp(-out_val))
-        output.ptr.offset(out_offset).store(out_val)
-
-# ===----------------------------------------------------------------------=== #
-
-
-fn naive_causal_conv1d_channel_first_fwd_gpu_no_bias[
-    x_dtype: DType,
-    x_layout: Layout,
-    weight_dtype: DType,
-    weight_layout: Layout,
-    output_dtype: DType,
-    output_layout: Layout,
-    BX: Int,
-](
-    batch: Int,
-    dim: Int,
-    seqlen: Int,
-    width: Int,
-
-    x: LayoutTensor[x_dtype, x_layout, MutAnyOrigin], # Shape (B, C, L)
-    weight: LayoutTensor[weight_dtype, weight_layout, MutAnyOrigin], # Shape (C, W)
-    output: LayoutTensor[output_dtype, output_layout, MutAnyOrigin], # Shape (B, C, L)
-
-    x_batch_stride: UInt32,
-    x_c_stride: UInt32,
-    x_l_stride: UInt32,
-
-    weight_c_stride: UInt32,
-    weight_width_stride: UInt32,
-
-    out_batch_stride: UInt32,
-    out_c_stride: UInt32,
-    out_l_stride: UInt32,
-
-    silu_activation: Int8,
-):
-    """Naive GPU implementation of causal conv1d for channel-first layout without bias.
-    
-    This is a straightforward loop-based implementation that works for any kernel width.
-    Good for correctness verification and fallback.
-    
-    Note: silu_activation is Int8 (0 or 1) instead of Bool for DevicePassable compatibility.
-    
-    Grid: (ceildiv(batch, 1), ceildiv(dim, BX), ceildiv(seqlen, BX))
-    Block: BX
-    
-    Args:
-        batch: Batch size.
-        dim: Number of channels.
-        seqlen: Sequence length.
-        width: Kernel width.
-        x: Input tensor of shape (B, C, L).
-        weight: Weight tensor of shape (C, W).
-        output: Output tensor of shape (B, C, L).
-        x_batch_stride: Stride for the batch dimension of the input tensor.
-        x_c_stride: Stride for the channel dimension of the input tensor.
-        x_l_stride: Stride for the sequence length dimension of the input tensor.
-        weight_c_stride: Stride for the channel dimension of the weight tensor.
-        weight_width_stride: Stride for the width dimension of the weight tensor.
-        out_batch_stride: Stride for the batch dimension of the output tensor.
-        out_c_stride: Stride for the channel dimension of the output tensor.
-        out_l_stride: Stride for the sequence length dimension of the output tensor.
-        silu_activation: Whether to apply SiLU activation (Int8: 0 or 1).
-    """
-    var B = x.dim(0)
-    var C = x.dim(1)
-    var L = x.dim(2)
-    var W = weight.dim(1)
-    var width_minus_1: Int = W - 1
-
-    var batch_idx = block_idx.x
-    var channel_idx = block_idx.y
-    var seqlen_idx = block_idx.z
-    var tid = thread_idx.x
-
-    var b: Int = Int(batch_idx)
-    var c: Int = Int(channel_idx) * Int(BX) + Int(tid)
-    var l_start: Int = Int(seqlen_idx) * Int(BX)
-    var l_end: Int = min(l_start + Int(BX), L)
-    
-    if c >= C or b >= B or l_start >= L:
-        return
-
-    var weight_c_base_offset: UInt32 = c * weight_c_stride
-    var silu_active = Bool(Int(silu_activation) != 0)
-
-    for l in range(l_start, l_end):
-        var conv_sum: Scalar[output.dtype] = 0.0
-        for w in range(W):
-            var input_l: Int = l - (width_minus_1 - w)
-            if input_l >= 0:
-                var x_offset: UInt32 = b * x_batch_stride + c * x_c_stride + input_l * x_l_stride
-                var input_val: Scalar[x.dtype] = x.ptr.offset(x_offset).load()
-                var weight_offset: UInt32 = weight_c_base_offset + w * weight_width_stride
-                var weight_val: Scalar[weight.dtype] = weight.ptr.offset(weight_offset).load()
-                conv_sum = conv_sum + Scalar[output_dtype](input_val * Scalar[x.dtype](weight_val))
-        
-        var out_offset: UInt32 = b * out_batch_stride + c * out_c_stride + l * out_l_stride
-        var out_val: Scalar[output.dtype] = conv_sum
-        if silu_active:
-            out_val = out_val / (1 + exp(-out_val))
-        output.ptr.offset(out_offset).store(out_val)
-
-fn naive_causal_conv1d_channel_last_fwd_gpu[
-    x_dtype: DType,
-    x_layout: Layout,
-    weight_dtype: DType,
-    weight_layout: Layout,
-    output_dtype: DType,
-    output_layout: Layout,
-    BX: Int,
-](
-    batch: Int,
-    dim: Int,
-    seqlen: Int,
-    width: Int,
-
-    x: LayoutTensor[x_dtype, x_layout, MutAnyOrigin], # Shape (B, L, C)
-    weight: LayoutTensor[weight_dtype, weight_layout, MutAnyOrigin], # Shape (C, W)
-    output: LayoutTensor[output_dtype, output_layout, MutAnyOrigin], # Shape (B, L, C)
-
-    bias_ptr: LegacyUnsafePointer[Scalar[weight.dtype]], # Shape (C), stride = 1
-    seq_idx_ptr: LegacyUnsafePointer[Int],
-    final_states_ptr: LegacyUnsafePointer[Scalar[output.dtype]], # Shape (B, W-1, L)
-    initial_states_ptr: LegacyUnsafePointer[Scalar[x.dtype]],
-
-    x_batch_stride: UInt32,
-    x_c_stride: UInt32,
-    x_l_stride: UInt32,
-
-    weight_c_stride: UInt32,
-    weight_width_stride: UInt32,
-
-    out_batch_stride: UInt32,
-    out_c_stride: UInt32,
-    out_l_stride: UInt32,
-
-    initial_states_batch_stride: UInt32,
-    initial_states_c_stride: UInt32,
-    initial_states_l_stride: UInt32,
-
-    final_states_batch_stride: UInt32,
-    final_states_c_stride: UInt32,
-    final_states_l_stride: UInt32,
-
-    silu_activation: Bool,
-):
-    """Naive GPU implementation of causal conv1d for channel-last layout.
-    
-    This is a straightforward loop-based implementation that works for any kernel width.
-    Good for correctness verification and fallback.
-    
-    Note: silu_activation is Int8 (0 or 1) instead of Bool for DevicePassable compatibility.
-    
-    Grid: (ceildiv(batch, 1), ceildiv(seqlen, BX), ceildiv(dim, BX))
-    Block: BX
-    
-    Args:
-        batch: Batch size.
-        dim: Number of channels.
-        seqlen: Sequence length.
-        width: Kernel width.
-        x: Input tensor of shape (B, L, C).
-        weight: Weight tensor of shape (C, W).
-        output: Output tensor of shape (B, L, C).
-        bias_ptr: Pointer to the bias tensor of shape (C,).
-        seq_idx_ptr: Pointer to the sequence index tensor (optional).
-        final_states_ptr: Pointer to the final states tensor (optional).
-        initial_states_ptr: Pointer to the initial states tensor (optional).
-        x_batch_stride: Stride for the batch dimension of the input tensor.
-        x_c_stride: Stride for the channel dimension of the input tensor.
-        x_l_stride: Stride for the sequence length dimension of the input tensor.
-        weight_c_stride: Stride for the channel dimension of the weight tensor.
-        weight_width_stride: Stride for the width dimension of the weight tensor.
-        out_batch_stride: Stride for the batch dimension of the output tensor.
-        out_c_stride: Stride for the channel dimension of the output tensor.
-        out_l_stride: Stride for the sequence length dimension of the output tensor.
-        initial_states_batch_stride: Stride for the batch dimension of the initial states.
-        initial_states_c_stride: Stride for the channel dimension of the initial states.
-        initial_states_l_stride: Stride for the sequence length dimension of the initial states.
-        final_states_batch_stride: Stride for the batch dimension of the final states.
-        final_states_c_stride: Stride for the channel dimension of the final states.
-        final_states_l_stride: Stride for the sequence length dimension of the final states.
-        silu_activation: Whether to apply SiLU activation (Int8: 0 or 1).
-    """
-
-    var B = batch
-    var L = seqlen
-    var C = dim
-    var W = width
-    var width_minus_1: Int = W - 1
-
-    var batch_idx = block_idx.x
-    var seqlen_idx = block_idx.y
-    var channel_idx = block_idx.z
-    var tid = thread_idx.x
-
-    var b: Int = Int(batch_idx)
-    var l: Int = Int(seqlen_idx) * BX + Int(tid)
-
-    if b >= B or l >= seqlen:
-        return
-
-    var cur_seq_idx: Int = 0
-    var seq_idx_l_stride: Int = 1
-    var seq_idx_batch_stride: Int = seqlen
-    # TODO: Implement seq_idx_ptr handling when needed
-    # For now, treat all positions as belonging to the same sequence
-
-    var c_start: Int = Int(channel_idx) * BX
-    var c_end: Int = min(c_start + BX, C)
-    var silu_active = Bool(Int(silu_activation) != 0)
-
-    for c in range(c_start, c_end):
-        if c >= C:
-            return
-
-        var cur_bias: Scalar[output.dtype] = 0.0
-        # TODO: Implement bias_ptr handling when needed
-        # For now, assume no bias
-        var conv_sum: Scalar[output.dtype] = cur_bias
-
-        for w in range(W):
-            var input_l: Int = l - (width_minus_1 - w)
-            var use_value: Bool = True
-            var input_val: Scalar[x.dtype] = 0.0
-
-            if input_l >= 0:
-                # TODO: Implement seq_idx validation when seq_idx_ptr is available
-                if use_value:
-                    var x_offset: UInt32 = b * x_batch_stride + input_l * x_l_stride + c * x_c_stride
-                    input_val = x.ptr.offset(x_offset).load()
-            # TODO: Implement initial_states_ptr handling when needed
-
-            if use_value:
-                var weight_offset: UInt32 = c * weight_c_stride + w * weight_width_stride
-                var weight_val: Scalar[weight.dtype] = weight.ptr.offset(weight_offset).load()
-                conv_sum = conv_sum + Scalar[output.dtype](input_val * Scalar[x.dtype](weight_val))
-
-        var out_offset: UInt32 = b * out_batch_stride + l * out_l_stride + c * out_c_stride
-        var out_val: Scalar[output.dtype] = conv_sum
-        if silu_active:
-            out_val = out_val / (1 + exp(-out_val))
-        output.ptr.offset(out_offset).store(out_val)
-
-
-# ===----------------------------------------------------------------------=== #
-# Optimized GPU Implementations
+# GPU Implementations
 # ===----------------------------------------------------------------------=== #
 
 
@@ -1387,7 +575,6 @@ fn causal_conv1d_channel_first_fwd_gpu[
     weight_layout: Layout,
     output_dtype: DType,
     output_layout: Layout,
-    layout_2d: Layout,
     kNThreads: Int,
     kWidth: Int,
     kNElts: Int,
@@ -1602,7 +789,6 @@ fn causal_conv1d_channel_first_fwd_gpu_no_bias[
     weight_layout: Layout,
     output_dtype: DType,
     output_layout: Layout,
-    layout_2d: Layout,
     kNThreads: Int,
     kWidth: Int,
     kNElts: Int,
@@ -1785,7 +971,6 @@ fn causal_conv1d_channel_last_fwd_gpu[
     weight_layout: Layout,
     output_dtype: DType,
     output_layout: Layout,
-    layout_2d: Layout,
     kNThreads: Int,
     kWidth: Int,
     kNElts: Int,
@@ -1947,7 +1132,6 @@ fn causal_conv1d_channel_last_fwd_gpu_no_bias[
     weight_layout: Layout,
     output_dtype: DType,
     output_layout: Layout,
-    layout_2d: Layout,
     kNThreads: Int,
     kWidth: Int,
     kNElts: Int,
@@ -3005,210 +2189,6 @@ fn causal_conv1d_channel_first_fwd_gpu_no_bias_with_seq_idx[
                 break
             var out_offset: UInt32 = batch_id * out_batch_stride + c_idx * out_c_stride + seq_pos * out_l_stride
             output.ptr.offset(out_offset).store(out_vals_channel[i])
-
-
-# ============================================================================
-# GPU Implementations with seq_idx as LayoutTensor (Naive)
-# ============================================================================
-
-# Naive GPU implementation for channel-last with bias and seq_idx as LayoutTensor
-fn naive_causal_conv1d_channel_last_fwd_gpu_with_seq_idx[
-    x_dtype: DType,
-    x_layout: Layout,
-    weight_dtype: DType,
-    weight_layout: Layout,
-    output_dtype: DType,
-    output_layout: Layout,
-    bias_dtype: DType,
-    bias_layout: Layout,
-    seq_idx_dtype: DType,
-    seq_idx_layout: Layout,
-    BX: Int,
-](
-    batch: Int,
-    dim: Int,
-    seqlen: Int,
-    width: Int,
-
-    x: LayoutTensor[x_dtype, x_layout, MutAnyOrigin], # Shape (B, L, C)
-    weight: LayoutTensor[weight_dtype, weight_layout, MutAnyOrigin], # Shape (C, W)
-    mut output: LayoutTensor[output_dtype, output_layout, MutAnyOrigin], # Shape (B, L, C)
-    bias: LayoutTensor[bias_dtype, bias_layout, MutAnyOrigin], # Shape (C,)
-    seq_idx: LayoutTensor[seq_idx_dtype, seq_idx_layout, MutAnyOrigin], # Shape (B, L)
-
-    x_batch_stride: UInt32,
-    x_c_stride: UInt32,
-    x_l_stride: UInt32,
-
-    weight_c_stride: UInt32,
-    weight_width_stride: UInt32,
-
-    out_batch_stride: UInt32,
-    out_c_stride: UInt32,
-    out_l_stride: UInt32,
-
-    seq_idx_batch_stride: UInt32,
-    seq_idx_l_stride: UInt32,
-
-    silu_activation: Bool,
-):
-    """Naive GPU implementation of causal conv1d for channel last data layout with seq_idx."""
-    var B = batch
-    var L = seqlen
-    var C = dim
-    var W = width
-    var width_minus_1: Int = W - 1
-
-    var batch_idx = block_idx.x
-    var seqlen_idx = block_idx.y
-    var channel_idx = block_idx.z
-    var tid = thread_idx.x
-
-    var b: Int = Int(batch_idx)
-    var l: Int = Int(seqlen_idx) * BX + Int(tid)
-
-    if b >= B or l >= seqlen:
-        return
-
-    var seq_idx_offset: UInt32 = b * seq_idx_batch_stride + l * seq_idx_l_stride
-    var cur_seq_idx_val = seq_idx.ptr.offset(seq_idx_offset).load()
-    var cur_seq_idx: Int32 = Int32(cur_seq_idx_val)
-
-    var c_start: Int = Int(channel_idx) * BX
-    var c_end: Int = min(c_start + BX, C)
-    var silu_active = Bool(Int(silu_activation) != 0)
-
-    for c in range(c_start, c_end):
-        if c >= C:
-            return
-
-        var cur_bias: Scalar[output.dtype] = Scalar[output.dtype](bias.ptr.offset(c).load())
-        var conv_sum: Scalar[output.dtype] = cur_bias
-
-        for w in range(W):
-            var input_l: Int = l - (width_minus_1 - w)
-            var use_value: Bool = True
-            var input_val: Scalar[x.dtype] = 0.0
-
-            if input_l >= 0:
-                var input_seq_idx_offset: UInt32 = b * seq_idx_batch_stride + input_l * seq_idx_l_stride
-                var input_seq_idx_val = seq_idx.ptr.offset(input_seq_idx_offset).load()
-                var input_seq_idx: Int32 = Int32(input_seq_idx_val)
-                if input_seq_idx != cur_seq_idx:
-                    use_value = False
-
-                if use_value:
-                    var x_offset: UInt32 = b * x_batch_stride + input_l * x_l_stride + c * x_c_stride
-                    input_val = x.ptr.offset(x_offset).load()
-
-            if use_value:
-                var weight_offset: UInt32 = c * weight_c_stride + w * weight_width_stride
-                var weight_val: Scalar[weight.dtype] = weight.ptr.offset(weight_offset).load()
-                conv_sum = conv_sum + Scalar[output.dtype](input_val * Scalar[x.dtype](weight_val))
-
-        var out_offset: UInt32 = b * out_batch_stride + l * out_l_stride + c * out_c_stride
-        var out_val: Scalar[output.dtype] = conv_sum
-        if silu_active:
-            out_val = out_val / (1 + exp(-out_val))
-        output.ptr.offset(out_offset).store(out_val)
-
-
-# Naive GPU implementation for channel-last without bias but with seq_idx as LayoutTensor
-fn naive_causal_conv1d_channel_last_fwd_gpu_no_bias_with_seq_idx[
-    x_dtype: DType,
-    x_layout: Layout,
-    weight_dtype: DType,
-    weight_layout: Layout,
-    output_dtype: DType,
-    output_layout: Layout,
-    seq_idx_dtype: DType,
-    seq_idx_layout: Layout,
-    BX: Int,
-](
-    batch: Int,
-    dim: Int,
-    seqlen: Int,
-    width: Int,
-
-    x: LayoutTensor[x_dtype, x_layout, MutAnyOrigin], # Shape (B, L, C)
-    weight: LayoutTensor[weight_dtype, weight_layout, MutAnyOrigin], # Shape (C, W)
-    mut output: LayoutTensor[output_dtype, output_layout, MutAnyOrigin], # Shape (B, L, C)
-    seq_idx: LayoutTensor[seq_idx_dtype, seq_idx_layout, MutAnyOrigin], # Shape (B, L)
-
-    x_batch_stride: UInt32,
-    x_c_stride: UInt32,
-    x_l_stride: UInt32,
-
-    weight_c_stride: UInt32,
-    weight_width_stride: UInt32,
-
-    out_batch_stride: UInt32,
-    out_c_stride: UInt32,
-    out_l_stride: UInt32,
-
-    seq_idx_batch_stride: UInt32,
-    seq_idx_l_stride: UInt32,
-
-    silu_activation: Bool,
-):
-    """Naive GPU implementation of causal conv1d for channel last data layout without bias but with seq_idx."""
-    var B = batch
-    var L = seqlen
-    var C = dim
-    var W = width
-    var width_minus_1: Int = W - 1
-
-    var batch_idx = block_idx.x
-    var seqlen_idx = block_idx.y
-    var channel_idx = block_idx.z
-    var tid = thread_idx.x
-
-    var b: Int = Int(batch_idx)
-    var l: Int = Int(seqlen_idx) * BX + Int(tid)
-
-    if b >= B or l >= seqlen:
-        return
-
-    var seq_idx_offset: UInt32 = b * seq_idx_batch_stride + l * seq_idx_l_stride
-    var cur_seq_idx_val = seq_idx.ptr.offset(seq_idx_offset).load()
-    var cur_seq_idx: Int32 = Int32(cur_seq_idx_val)
-
-    var c_start: Int = Int(channel_idx) * BX
-    var c_end: Int = min(c_start + BX, C)
-    var silu_active = Bool(Int(silu_activation) != 0)
-
-    for c in range(c_start, c_end):
-        if c >= C:
-            return
-
-        var conv_sum: Scalar[output.dtype] = 0.0
-
-        for w in range(W):
-            var input_l: Int = l - (width_minus_1 - w)
-            var use_value: Bool = True
-            var input_val: Scalar[x.dtype] = 0.0
-
-            if input_l >= 0:
-                var input_seq_idx_offset: UInt32 = b * seq_idx_batch_stride + input_l * seq_idx_l_stride
-                var input_seq_idx_val = seq_idx.ptr.offset(input_seq_idx_offset).load()
-                var input_seq_idx: Int32 = Int32(input_seq_idx_val)
-                if input_seq_idx != cur_seq_idx:
-                    use_value = False
-
-                if use_value:
-                    var x_offset: UInt32 = b * x_batch_stride + input_l * x_l_stride + c * x_c_stride
-                    input_val = x.ptr.offset(x_offset).load()
-
-            if use_value:
-                var weight_offset: UInt32 = c * weight_c_stride + w * weight_width_stride
-                var weight_val: Scalar[weight.dtype] = weight.ptr.offset(weight_offset).load()
-                conv_sum = conv_sum + Scalar[output.dtype](input_val * Scalar[x.dtype](weight_val))
-
-        var out_offset: UInt32 = b * out_batch_stride + l * out_l_stride + c * out_c_stride
-        var out_val: Scalar[output.dtype] = conv_sum
-        if silu_active:
-            out_val = out_val / (1 + exp(-out_val))
-        output.ptr.offset(out_offset).store(out_val)
 
 
 # ============================================================================

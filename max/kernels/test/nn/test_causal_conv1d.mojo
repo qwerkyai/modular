@@ -26,8 +26,7 @@ from layout._fillers import random
 from layout.int_tuple import fill_like
 from memory import alloc
 from nn.causal_conv1d import (
-    naive_causal_conv1d_channel_first_fwd_cpu,
-    optimized_causal_conv1d_channel_first_fwd_cpu,
+    causal_conv1d_channel_first_fwd_cpu,
 )
 from testing import assert_almost_equal
 
@@ -47,7 +46,6 @@ fn silu_ref[dtype: DType](x: Scalar[dtype]) -> Scalar[dtype]:
 
 fn run_causal_conv1d[
     dtype: DType,
-    algorithm: StaticString,
     activation: StaticString,
 ](
     batch: Int,
@@ -106,66 +104,35 @@ fn run_causal_conv1d[
     
     var silu_activation = activation == "silu"
     
-    # Test fused kernel
-    @parameter
-    if algorithm == "naive":
-        naive_causal_conv1d_channel_first_fwd_cpu[
-            input_buf.dtype,
-            input_buf.layout,
-            weight_buf.dtype,
-            weight_buf.layout,
-            result_fused_buf.dtype,
-            result_fused_buf.layout,
-            bias_buf.dtype,
-            bias_buf.layout,
-        ](
-            batch,
-            dim,
-            seqlen,
-            width,
-            input_buf,
-            weight_buf,
-            result_fused_buf,
-            bias_buf,
-            x_batch_stride,
-            x_c_stride,
-            x_l_stride,
-            weight_c_stride,
-            weight_width_stride,
-            out_batch_stride,
-            out_c_stride,
-            out_l_stride,
-            silu_activation,
-        )
-    elif algorithm == "optimized":
-        optimized_causal_conv1d_channel_first_fwd_cpu[
-            input_buf.dtype,
-            input_buf.layout,
-            weight_buf.dtype,
-            weight_buf.layout,
-            result_fused_buf.dtype,
-            result_fused_buf.layout,
-            bias_buf.dtype,
-            bias_buf.layout,
-        ](
-            batch,
-            dim,
-            seqlen,
-            width,
-            input_buf,
-            weight_buf,
-            result_fused_buf,
-            bias_buf,
-            x_batch_stride,
-            x_c_stride,
-            x_l_stride,
-            weight_c_stride,
-            weight_width_stride,
-            out_batch_stride,
-            out_c_stride,
-            out_l_stride,
-            silu_activation,
-        )
+    # Test kernel
+    causal_conv1d_channel_first_fwd_cpu[
+        input_buf.dtype,
+        input_buf.layout,
+        weight_buf.dtype,
+        weight_buf.layout,
+        result_fused_buf.dtype,
+        result_fused_buf.layout,
+        bias_buf.dtype,
+        bias_buf.layout,
+    ](
+        batch,
+        dim,
+        seqlen,
+        width,
+        input_buf,
+        weight_buf,
+        result_fused_buf,
+        bias_buf,
+        x_batch_stride,
+        x_c_stride,
+        x_l_stride,
+        weight_c_stride,
+        weight_width_stride,
+        out_batch_stride,
+        out_c_stride,
+        out_l_stride,
+        silu_activation,
+    )
     
     # Reference implementation
     var width_minus_1: Int = width - 1
@@ -209,25 +176,26 @@ fn run_causal_conv1d[
 
 def main():
     # Test basic cases
-    run_causal_conv1d[DType.float32, "naive", "none"](2, 4, 8, 3)
+    run_causal_conv1d[DType.float32, "none"](2, 4, 8, 3)
     print("✓ Basic causal conv1d test passed")
     
-    run_causal_conv1d[DType.float32, "naive", "silu"](2, 4, 8, 3)
+    run_causal_conv1d[DType.float32, "silu"](2, 4, 8, 3)
     print("✓ Causal conv1d with SiLU test passed")
     
-    run_causal_conv1d[DType.float32, "optimized", "none"](2, 8, 16, 4)
-    print("✓ Optimized causal conv1d test passed")
+    run_causal_conv1d[DType.float32, "none"](2, 8, 16, 4)
+    print("✓ Causal conv1d width 4 test passed")
     
-    run_causal_conv1d[DType.float32, "optimized", "silu"](2, 8, 16, 3)
-    print("✓ Optimized causal conv1d with SiLU test passed")
+    run_causal_conv1d[DType.float32, "silu"](2, 8, 16, 3)
+    print("✓ Causal conv1d with SiLU width 3 test passed")
     
     # Test various widths
-    run_causal_conv1d[DType.float32, "naive", "none"](2, 4, 8, 2)
-    run_causal_conv1d[DType.float32, "naive", "none"](2, 4, 8, 3)
-    run_causal_conv1d[DType.float32, "naive", "none"](2, 4, 8, 4)
+    run_causal_conv1d[DType.float32, "none"](2, 4, 8, 1)
+    run_causal_conv1d[DType.float32, "none"](2, 4, 8, 2)
+    run_causal_conv1d[DType.float32, "none"](2, 4, 8, 3)
+    run_causal_conv1d[DType.float32, "none"](2, 4, 8, 4)
     print("✓ Various widths test passed")
     
     # Test larger sequences
-    run_causal_conv1d[DType.float32, "naive", "none"](2, 16, 128, 3)
+    run_causal_conv1d[DType.float32, "none"](2, 16, 128, 3)
     print("✓ Large sequence test passed")
 

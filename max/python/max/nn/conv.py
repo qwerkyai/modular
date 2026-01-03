@@ -950,20 +950,25 @@ def causal_conv1d_fn(
             bias_tensor = bias_tensor.to(x.device)
     
     # Call causal_conv1d kernel
-    # The kernel returns (output, xx2D_scratch), we only need the output
+    # The kernel requires a 2D scratch tensor: (batch * channels, seqlen)
+    batch_dim = x.shape[0]
+    channels_dim = x.shape[1]
+    seqlen_dim = x.shape[2]
+    xx2d_shape = [batch_dim * channels_dim, seqlen_dim]
+
     results = ops.custom(
         "causal_conv1d",
         x.device,
         [x, weight_cast, bias_tensor],
         [
-            TensorType(dtype=x.dtype, shape=x.shape, device=x.device),  # output
-            TensorType(dtype=x.dtype, shape=x.shape, device=x.device),  # xx2D scratch (discarded)
+            TensorType(dtype=x.dtype, shape=x.shape, device=x.device),  # output (3D)
+            TensorType(dtype=x.dtype, shape=xx2d_shape, device=x.device),  # xx2D scratch (2D)
         ],
         parameters={
             "algorithm": algorithm_param,
             "activation": activation_param,
         },
     )
-    
+
     # Return only the output (first result), discard the scratch tensor
     return results[0].tensor

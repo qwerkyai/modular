@@ -14,8 +14,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
@@ -52,6 +54,62 @@ from .mamba import Mamba
 from .model_config import MambaConfig
 
 logger = logging.getLogger("max.pipelines")
+
+# Environment variable name for Mojo import paths set by the build system.
+_MODULAR_MOJO_MAX_IMPORT_PATH = "MODULAR_MOJO_MAX_IMPORT_PATH"
+
+
+def _get_kernel_library_paths() -> list[Path]:
+    """Returns kernel library paths from the build environment.
+
+    Reads the ``MODULAR_MOJO_MAX_IMPORT_PATH`` environment variable set by the
+    Bazel build system and extracts paths to ``.mojopkg`` kernel libraries.
+    This is required for Mamba models because they use custom kernels
+    (causal_conv1d, selective_scan_fwd) that must be explicitly loaded.
+
+    The function looks for MambaKernelAPI which contains only the mamba-specific
+    kernels. This avoids conflicts with default kernels like rms_norm that are
+    already registered by the runtime.
+
+    Returns:
+        A list of Path objects pointing to ``.mojopkg`` kernel libraries.
+        Returns an empty list if the environment variable is not set.
+    """
+    import_path_env = os.environ.get(_MODULAR_MOJO_MAX_IMPORT_PATH, "")
+    if not import_path_env:
+        logger.warning("MODULAR_MOJO_MAX_IMPORT_PATH not set, no custom kernels will be loaded")
+        return []
+
+    paths: list[Path] = []
+    for entry in import_path_env.split(","):
+        if not entry:
+            continue
+
+        entry_path = Path(entry)
+        if not entry_path.exists():
+            logger.debug(f"Path does not exist: {entry_path}")
+            continue
+
+        # Load MOGGKernelAPI - the main kernel package containing all kernels
+        # including causal_conv1d and selective_scan_fwd
+        if "MOGGKernelAPI" not in entry_path.name:
+            logger.debug(f"Skipping non-MOGGKernelAPI path: {entry_path}")
+            continue
+
+        # If it's a directory, look for .mojopkg files inside
+        if entry_path.is_dir():
+            for mojopkg in entry_path.glob("*.mojopkg"):
+                if mojopkg.is_file() or mojopkg.is_symlink():
+                    logger.info(f"Loading kernel library: {mojopkg}")
+                    paths.append(mojopkg)
+        # If it's already a .mojopkg file, use it directly
+        elif entry_path.suffix == ".mojopkg":
+            logger.info(f"Loading kernel library: {entry_path}")
+            paths.append(entry_path)
+
+    if not paths:
+        logger.warning(f"No MOGGKernelAPI.mojopkg found in {import_path_env}")
+    return paths
 
 
 class MambaInputs(ModelInputs):
@@ -515,6 +573,7 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
             with Graph(
                 getattr(self.huggingface_config, "model_type", "mamba"),
                 input_types=dist_model.input_types(self.kv_params),
+                custom_extensions=_get_kernel_library_paths(),
             ) as graph:
                 tokens, input_row_offsets, return_n_logits, *variadic_args = (
                     graph.inputs
@@ -562,6 +621,7 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
                 input_types=single_model.input_types(
                     self.kv_params, self._lora_manager
                 ),
+                custom_extensions=_get_kernel_library_paths(),
             ) as graph:
                 if self._lora_manager:
                     (

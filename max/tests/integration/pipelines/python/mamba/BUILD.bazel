@@ -1,1 +1,42 @@
+# Mamba pipeline tests.
 
+load("@mojo//:mojo.bzl", "PROD_MOJOPKGS")
+load(
+    "//bazel:api.bzl",
+    "modular_py_test",
+    "requirement",
+)
+
+package(default_visibility = [
+    "//:__pkg__",
+    "//max/tests:__subpackages__",
+    "//open-source/max/max/tests:__subpackages__",
+])
+
+# MOGGKernelAPI in PROD_MOJOPKGS contains causal_conv1d and selective_scan_fwd
+modular_py_test(
+    name = "test_mamba_130m",
+    size = "enormous",
+    srcs = [
+        "test_mamba_130m.py",
+    ],
+    env = {
+        "MODULAR_PATH": ".",
+    },
+    imports = [
+        "../",  # For hf_repo_lock
+    ],
+    mojo_deps = select({
+        "//:emit_mojo_enabled": PROD_MOJOPKGS,
+        "//conditions:default": [],
+    }),
+    tags = [
+        "no-sandbox",
+        "requires-network",
+    ],
+    deps = [
+        "//max/python/max/entrypoints:pipelines",
+        "//max/tests/integration/pipelines/python:hf_repo_lock",
+        requirement("transformers"),
+    ],
+)

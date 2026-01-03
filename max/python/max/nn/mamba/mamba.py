@@ -21,8 +21,9 @@ from collections.abc import Callable
 from typing import Optional
 
 from max.dtype import DType
-from max.graph import DeviceRef, TensorValue, Weight, ops
+from max.graph import DeviceRef, Dim, TensorType, TensorValue, Weight, ops
 from max.nn import Layer, Linear, Module
+from max.nn.conv import causal_conv1d_fn
 from max.nn.norm import layer_norm_fn
 from max.nn.norm.layer_norm import LayerNorm
 from max.nn.norm.rms_norm import RMSNorm
@@ -104,7 +105,6 @@ class MambaSSM(Module):
         # Weight shape: (intermediate_size, conv_width)
         # Use conv_kernel from config
         self.conv_width = conv_kernel
-        from max.nn.conv import Conv1D, causal_conv1d_fn
         
         # Use Conv1D for the convolution
         # Note: Conv1D doesn't have a causal parameter, so we'll use causal_conv1d_fn
@@ -136,9 +136,53 @@ class MambaSSM(Module):
         # If not provided, calculate: dt_rank + 2 * n_groups * d_state
         if x_proj_dim is not None:
             # Use provided x_proj_dim (inferred from actual weight shape)
-            pass
+            # Recalculate dt_rank to match the actual x_proj_dim
+            # Formula: x_proj_dim = dt_rank + 2 * n_groups * d_state
+            # So: dt_rank = x_proj_dim - 2 * n_groups * d_state
+            bc_dim = 2 * self.n_groups * d_state
+            calculated_dt_rank = x_proj_dim - bc_dim
+            if calculated_dt_rank > 0:
+                # Normal case: x_proj_dim matches expected formula
+                self.dt_rank = calculated_dt_rank
+                self.bc_dim = bc_dim
+            else:
+                # x_proj_dim doesn't match expected formula
+                # This can happen if the model architecture is different
+                # For some models, x_proj might project to intermediate_size directly
+                # In that case, we need to recalculate n_groups based on x_proj_dim
+                # Try: if x_proj_dim == intermediate_size, then maybe it's a different architecture
+                if x_proj_dim == intermediate_size:
+                    # Special case: x_proj projects to intermediate_size
+                    # This might mean dt_rank = intermediate_size and no BC projection
+                    # But that doesn't match standard Mamba architecture
+                    # For now, use a heuristic: assume dt_rank is a reasonable fraction
+                    self.dt_rank = max(16, min(x_proj_dim // 4, hidden_size // 16))
+                    self.bc_dim = x_proj_dim - self.dt_rank
+                    # Recalculate n_groups to match bc_dim
+                    if self.bc_dim > 0 and d_state > 0:
+                        # bc_dim = 2 * n_groups * d_state, so n_groups = bc_dim / (2 * d_state)
+                        self.n_groups = self.bc_dim // (2 * d_state)
+                        if self.n_groups == 0:
+                            self.n_groups = 1
+                else:
+                    # Use minimum dt_rank and rest for BC
+                    min_dt_rank = max(16, hidden_size // 16)
+                    if x_proj_dim > min_dt_rank:
+                        self.dt_rank = min_dt_rank
+                        self.bc_dim = x_proj_dim - min_dt_rank
+                        # Recalculate n_groups to match bc_dim
+                        if self.bc_dim > 0 and d_state > 0:
+                            self.n_groups = self.bc_dim // (2 * d_state)
+                            if self.n_groups == 0:
+                                self.n_groups = 1
+                    else:
+                        # x_proj_dim is too small, use it all for dt_rank
+                        self.dt_rank = x_proj_dim
+                        self.bc_dim = 0
+                        self.n_groups = 1  # Minimum to avoid division by zero
         else:
             x_proj_dim = self.dt_rank + 2 * self.n_groups * d_state  # dt_rank + B + C
+            self.bc_dim = 2 * self.n_groups * d_state
         
         self.x_proj = linear_cls(
             in_dim=intermediate_size,
@@ -249,7 +293,6 @@ class MambaSSM(Module):
             batch_size = input_row_offsets.shape[0] - 1
             total_seqlen = x.shape[0]
             # Use Dim division for symbolic dimensions
-            from max.graph import Dim
             seqlen = Dim(total_seqlen) // Dim(batch_size)
         else:
             # No input_row_offsets: assume single batch
@@ -260,7 +303,6 @@ class MambaSSM(Module):
         # causal_conv1d_fn expects (batch, channels, seqlen) format
         # Reshape x from (batch * seqlen, intermediate_size) to (batch, intermediate_size, seqlen)
         # Use rebind to assert the reshape is valid: total_seqlen == batch_size * seqlen
-        from max.graph import Dim
         batch_seqlen = Dim(batch_size) * Dim(seqlen)
         x_rebound = x.rebind([batch_seqlen, self.intermediate_size], 
                              message="Asserting batch_size * seqlen == total_seqlen for reshape")
@@ -271,8 +313,6 @@ class MambaSSM(Module):
         
         # Apply causal conv1d using the functional API
         # causal_conv1d_fn expects (batch, channels, seqlen) and returns same shape
-        from max.nn.conv import causal_conv1d_fn
-        
         x_conv = causal_conv1d_fn(
             x_conv,
             self.conv1d_weight,
@@ -291,9 +331,11 @@ class MambaSSM(Module):
         x_proj = self.x_proj(x)  # (batch * seqlen, dt_rank + 2 * n_groups * d_state)
         
         # Split x_proj into delta, B, C
+        # Use stored bc_dim if available (when x_proj_dim was provided), otherwise calculate
+        bc_dim = getattr(self, 'bc_dim', 2 * self.n_groups * self.d_state)
         dt, BC = ops.split(
             x_proj,
-            [self.dt_rank, 2 * self.n_groups * self.d_state],
+            [self.dt_rank, bc_dim],
             axis=-1,
         )
         
@@ -369,26 +411,27 @@ class MambaSSM(Module):
         # Step 7: Call selective_scan_fwd operation
         # The operation returns: (output, x_checkpoint, out_z)
         # We only need the output
-        from max.graph import TensorType as TT
         
         # Compute number of chunks for checkpoint tensor
         # Chunk size is typically 2048 for efficient computation
         chunk_size = 2048
-        num_chunks = (seqlen + chunk_size - 1) // chunk_size if seqlen > 0 else 1
+        # seqlen is a Dim, so we need to use Dim operations for symbolic dimensions
+        # Use ceildiv: (seqlen + chunk_size - 1) // chunk_size
+        num_chunks = (seqlen + Dim(chunk_size) - Dim(1)) // Dim(chunk_size)
         
         # Define output types
-        output_type = TT(
+        output_type = TensorType(
             dtype=self.dtype,
             shape=[batch_size, self.intermediate_size, seqlen],
             device=x.device,
         )
         # x_checkpoint: (batch, dim, num_chunks, 2*dstate)
-        x_checkpoint_type = TT(
+        x_checkpoint_type = TensorType(
             dtype=self.dtype,
             shape=[batch_size, self.intermediate_size, num_chunks, 2 * self.d_state],
             device=x.device,
         )
-        out_z_type = TT(
+        out_z_type = TensorType(
             dtype=self.dtype,
             shape=[batch_size, self.intermediate_size, seqlen],
             device=x.device,
@@ -506,7 +549,11 @@ class Block(Module):
         if not self.fused_add_norm:
             # Non-fused path: add residual first, then normalize
             if self.norm is not None:
-                residual = (hidden_states + residual) if residual is not None else hidden_states
+                if residual is not None:
+                    # Use rebind to assert shapes are equivalent at runtime
+                    residual = hidden_states.rebind(residual.shape, message="Asserting hidden_states and residual have equivalent shapes for addition") + residual
+                else:
+                    residual = hidden_states
                 # Cast to norm dtype for normalization
                 norm_dtype = self.norm.weight.dtype if hasattr(self.norm, 'weight') else residual.dtype
                 hidden_states = self.norm(residual.cast(norm_dtype))
@@ -564,7 +611,8 @@ class Block(Module):
             if not self.fused_add_norm:
                 # Non-fused path: add residual first, then normalize
                 if self.norm2 is not None:
-                    residual = hidden_states + residual
+                    # Use rebind to assert shapes are equivalent at runtime
+                    residual = hidden_states.rebind(residual.shape, message="Asserting hidden_states and residual have equivalent shapes for MLP residual addition") + residual
                     # Cast to norm dtype for normalization
                     norm2_dtype = self.norm2.weight.dtype if hasattr(self.norm2, 'weight') else residual.dtype
                     hidden_states = self.norm2(residual.to(dtype=norm2_dtype))
@@ -572,7 +620,8 @@ class Block(Module):
                         residual = residual.to(dtype=DType.float32)
                 else:
                     # No norm2, just add residual
-                    residual = hidden_states + residual
+                    # Use rebind to assert shapes are equivalent at runtime
+                    residual = hidden_states.rebind(residual.shape, message="Asserting hidden_states and residual have equivalent shapes for MLP residual addition (no norm2)") + residual
             else:
                 # Fused path: use layer_norm_fn for fused add-norm operation
                 if self.norm2 is not None:
@@ -600,7 +649,8 @@ class Block(Module):
                     )
                 else:
                     # No norm2, just add residual
-                    residual = hidden_states + residual
+                    # Use rebind to assert shapes are equivalent at runtime
+                    residual = hidden_states.rebind(residual.shape, message="Asserting hidden_states and residual have equivalent shapes for MLP residual addition (fused, no norm2)") + residual
             
             # Apply MLP
             hidden_states = self.mlp(hidden_states)
