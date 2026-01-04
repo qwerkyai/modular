@@ -143,37 +143,38 @@ fn run_mamba_split_conv1d_scan_combined_gpu[
         random(outproj_bias_init)
     
     # Allocate GPU memory
-    var zxbcdt_d = ctx.alloc[Scalar[dtype]](zxbcdt_size)
-    var conv_weight_d = ctx.alloc[Scalar[dtype]](conv_weight_size)
-    var conv_bias_d = ctx.alloc[Scalar[dtype]](conv_bias_size)
-    var dt_bias_d = ctx.alloc[Scalar[dtype]](dt_bias_size)
-    var A_d = ctx.alloc[Scalar[dtype]](A_size)
-    var D_d = ctx.alloc[Scalar[dtype]](max(D_size, 1))
-    var x_d = ctx.alloc[Scalar[dtype]](x_size)
-    var out_z_d = ctx.alloc[Scalar[dtype]](out_z_size)
-    var dt_d = ctx.alloc[Scalar[dtype]](dt_size)
-    var B_d = ctx.alloc[Scalar[dtype]](B_size)
-    var C_d = ctx.alloc[Scalar[dtype]](C_size)
-    var z_d = ctx.alloc[Scalar[dtype]](z_size)
-    var rmsnorm_weight_d = ctx.alloc[Scalar[dtype]](max(rmsnorm_weight_size, 1))
-    var outproj_weight_d = ctx.alloc[Scalar[dtype]](max(outproj_weight_size, 1))
-    var outproj_bias_d = ctx.alloc[Scalar[dtype]](max(outproj_bias_size, 1))
-    var output_cpu_d = ctx.alloc[Scalar[dtype]](output_size)
-    var output_gpu_d = ctx.alloc[Scalar[dtype]](output_size)
+    var zxbcdt_d = ctx.enqueue_create_buffer[dtype](zxbcdt_size)
+    var conv_weight_d = ctx.enqueue_create_buffer[dtype](conv_weight_size)
+    var conv_bias_d = ctx.enqueue_create_buffer[dtype](conv_bias_size)
+    var dt_bias_d = ctx.enqueue_create_buffer[dtype](dt_bias_size)
+    var A_d = ctx.enqueue_create_buffer[dtype](A_size)
+    var D_d = ctx.enqueue_create_buffer[dtype](max(D_size, 1))
+    var x_d = ctx.enqueue_create_buffer[dtype](x_size)
+    var out_z_d = ctx.enqueue_create_buffer[dtype](out_z_size)
+    var dt_d = ctx.enqueue_create_buffer[dtype](dt_size)
+    var B_d = ctx.enqueue_create_buffer[dtype](B_size)
+    var C_d = ctx.enqueue_create_buffer[dtype](C_size)
+    var z_d = ctx.enqueue_create_buffer[dtype](z_size)
+    var rmsnorm_weight_d = ctx.enqueue_create_buffer[dtype](max(rmsnorm_weight_size, 1))
+    var outproj_weight_d = ctx.enqueue_create_buffer[dtype](max(outproj_weight_size, 1))
+    var outproj_bias_d = ctx.enqueue_create_buffer[dtype](max(outproj_bias_size, 1))
+    var output_cpu_d = ctx.enqueue_create_buffer[dtype](output_size)
+    var output_gpu_d = ctx.enqueue_create_buffer[dtype](output_size)
     
     # Copy to GPU
-    ctx.memcpy_h2d(zxbcdt_d, zxbcdt_h, zxbcdt_size)
-    ctx.memcpy_h2d(conv_weight_d, conv_weight_h, conv_weight_size)
-    ctx.memcpy_h2d(conv_bias_d, conv_bias_h, conv_bias_size)
-    ctx.memcpy_h2d(dt_bias_d, dt_bias_h, dt_bias_size)
-    ctx.memcpy_h2d(A_d, A_h, A_size)
-    if has_D:
-        ctx.memcpy_h2d(D_d, D_h, D_size)
-    if has_rmsnorm:
-        ctx.memcpy_h2d(rmsnorm_weight_d, rmsnorm_weight_h, rmsnorm_weight_size)
-    if has_outproj:
-        ctx.memcpy_h2d(outproj_weight_d, outproj_weight_h, outproj_weight_size)
-        ctx.memcpy_h2d(outproj_bias_d, outproj_bias_h, outproj_bias_size)
+    with ctx.push_context():
+        ctx.enqueue_copy(zxbcdt_d, zxbcdt_h)
+        ctx.enqueue_copy(conv_weight_d, conv_weight_h)
+        ctx.enqueue_copy(conv_bias_d, conv_bias_h)
+        ctx.enqueue_copy(dt_bias_d, dt_bias_h)
+        ctx.enqueue_copy(A_d, A_h)
+        if has_D:
+            ctx.enqueue_copy(D_d, D_h)
+        if has_rmsnorm:
+            ctx.enqueue_copy(rmsnorm_weight_d, rmsnorm_weight_h)
+        if has_outproj:
+            ctx.enqueue_copy(outproj_weight_d, outproj_weight_h)
+            ctx.enqueue_copy(outproj_bias_d, outproj_bias_h)
     
     # Create LayoutTensors for GPU
     var zxbcdt_gpu_lt = LayoutTensor[dtype, layout_3d](
@@ -532,8 +533,9 @@ fn run_mamba_split_conv1d_scan_combined_gpu[
     )
     
     # Copy results back
-    ctx.memcpy_d2h(output_cpu_h, output_cpu_d, output_size)
-    ctx.memcpy_d2h(output_gpu_h, output_gpu_d, output_size)
+    with ctx.push_context():
+        ctx.enqueue_copy(output_cpu_h, output_cpu_d)
+        ctx.enqueue_copy(output_gpu_h, output_gpu_d)
     
     # Compare results
     for i in range(output_size):
@@ -561,27 +563,28 @@ fn run_mamba_split_conv1d_scan_combined_gpu[
     outproj_bias_h.free()
     output_cpu_h.free()
     output_gpu_h.free()
-    ctx.free(zxbcdt_d)
-    ctx.free(conv_weight_d)
-    ctx.free(conv_bias_d)
-    ctx.free(dt_bias_d)
-    ctx.free(A_d)
-    ctx.free(D_d)
-    ctx.free(x_d)
-    ctx.free(out_z_d)
-    ctx.free(dt_d)
-    ctx.free(B_d)
-    ctx.free(C_d)
-    ctx.free(z_d)
-    ctx.free(rmsnorm_weight_d)
-    ctx.free(outproj_weight_d)
-    ctx.free(outproj_bias_d)
-    ctx.free(output_cpu_d)
-    ctx.free(output_gpu_d)
+    # Device buffers are automatically freed when they go out of scope
+    _ = zxbcdt_d^
+    _ = conv_weight_d^
+    _ = conv_bias_d^
+    _ = dt_bias_d^
+    _ = A_d^
+    _ = D_d^
+    _ = x_d^
+    _ = out_z_d^
+    _ = dt_d^
+    _ = B_d^
+    _ = C_d^
+    _ = z_d^
+    _ = rmsnorm_weight_d^
+    _ = outproj_weight_d^
+    _ = outproj_bias_d^
+    _ = output_cpu_d^
+    _ = output_gpu_d^
 
 
 def main():
-    var ctx = DeviceContext.create()
+    var ctx = DeviceContext()
     
     run_mamba_split_conv1d_scan_combined_gpu[DType.float32, has_D=True, has_rmsnorm=False, has_outproj=False, norm_before_gate=True, delta_softplus=True](
         batch=2, seqlen=8, dim=4, nheads=2, headdim=2, dstate=4, ngroups=1, width=4, chunk_size=4, ctx=ctx

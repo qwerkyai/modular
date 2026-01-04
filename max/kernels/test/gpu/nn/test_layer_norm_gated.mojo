@@ -92,23 +92,24 @@ fn run_layer_norm_gated_gpu[
     ctx.enqueue_copy(z_d, z_h)
     ctx.enqueue_copy(gamma_d, gamma_h)
     ctx.enqueue_copy(beta_d, beta_h)
+    ctx.synchronize()
 
-    # Create LayoutTensors
+    # Create LayoutTensors with MutAnyOrigin for GPU (use DeviceBuffer directly)
     comptime layout = Layout.row_major[rank]()
     comptime layout_1d = Layout.row_major(UNKNOWN_VALUE)
-    var input_buf = LayoutTensor[dtype, layout](
+    var input_buf = LayoutTensor[dtype, layout, MutAnyOrigin](
         input_d, RuntimeLayout[layout].row_major(shape)
     )
-    var z_buf = LayoutTensor[dtype, layout](
+    var z_buf = LayoutTensor[dtype, layout, MutAnyOrigin](
         z_d, RuntimeLayout[layout].row_major(shape)
     )
-    var result_gpu_buf = LayoutTensor[dtype, layout](
+    var result_gpu_buf = LayoutTensor[dtype, layout, MutAnyOrigin](
         result_gpu_d, RuntimeLayout[layout].row_major(shape)
     )
-    var gamma = LayoutTensor[dtype, layout_1d](
+    var gamma = LayoutTensor[dtype, layout_1d, MutAnyOrigin](
         gamma_d, RuntimeLayout[layout_1d].row_major(Index(cols))
     )
-    var beta = LayoutTensor[dtype, layout_1d](
+    var beta = LayoutTensor[dtype, layout_1d, MutAnyOrigin](
         beta_d, RuntimeLayout[layout_1d].row_major(Index(cols))
     )
     var epsilon = Scalar[dtype](0.001)
@@ -267,8 +268,8 @@ fn run_layer_norm_gated_gpu[
     @__copy_capture(result_gpu_buf)
     @parameter
     fn gpu_output_fn[
-        width: Int, _rank: Int, alignment: Int
-    ](coords: IndexList[_rank], val: SIMD[dtype, width]) -> None:
+        width: Int, rank: Int, alignment: Int
+    ](coords: IndexList[rank], val: SIMD[dtype, width]) -> None:
         var idx = result_gpu_buf.runtime_layout(
             RuntimeTuple[
                 fill_like(result_gpu_buf.layout.shape, UNKNOWN_VALUE)
@@ -319,22 +320,28 @@ fn run_layer_norm_gated_gpu[
 def main():
     with DeviceContext() as ctx:
         # Test GPU LayerNorm with gating (norm_before_gate=True)
-        run_layer_norm_gated_gpu[DType.float32, has_z=True, has_bias=True, is_rms_norm=False, norm_before_gate=True](Index(5), ctx)
         run_layer_norm_gated_gpu[DType.float32, has_z=True, has_bias=True, is_rms_norm=False, norm_before_gate=True](Index(2, 128), ctx)
+        run_layer_norm_gated_gpu[DType.float32, has_z=True, has_bias=True, is_rms_norm=False, norm_before_gate=True](Index(4, 256), ctx)
+        print("✓ LayerNorm with gating (norm_before_gate=True) passed")
         
         # Test GPU LayerNorm with gating (norm_before_gate=False)
-        run_layer_norm_gated_gpu[DType.float32, has_z=True, has_bias=True, is_rms_norm=False, norm_before_gate=False](Index(5), ctx)
         run_layer_norm_gated_gpu[DType.float32, has_z=True, has_bias=True, is_rms_norm=False, norm_before_gate=False](Index(2, 128), ctx)
+        run_layer_norm_gated_gpu[DType.float32, has_z=True, has_bias=True, is_rms_norm=False, norm_before_gate=False](Index(4, 256), ctx)
+        print("✓ LayerNorm with gating (norm_before_gate=False) passed")
         
         # Test GPU RMSNorm with gating
-        run_layer_norm_gated_gpu[DType.float32, has_z=True, has_bias=False, is_rms_norm=True, norm_before_gate=True](Index(5), ctx)
+        run_layer_norm_gated_gpu[DType.float32, has_z=True, has_bias=False, is_rms_norm=True, norm_before_gate=True](Index(2, 64), ctx)
         run_layer_norm_gated_gpu[DType.float32, has_z=True, has_bias=False, is_rms_norm=True, norm_before_gate=True](Index(2, 128), ctx)
+        run_layer_norm_gated_gpu[DType.float32, has_z=True, has_bias=False, is_rms_norm=True, norm_before_gate=True](Index(4, 256), ctx)
+        print("✓ RMSNorm with gating passed")
         
         # Test GPU without gating
-        run_layer_norm_gated_gpu[DType.float32, has_z=False, has_bias=True, is_rms_norm=False, norm_before_gate=True](Index(5), ctx)
         run_layer_norm_gated_gpu[DType.float32, has_z=False, has_bias=True, is_rms_norm=False, norm_before_gate=True](Index(2, 128), ctx)
+        run_layer_norm_gated_gpu[DType.float32, has_z=False, has_bias=True, is_rms_norm=False, norm_before_gate=True](Index(4, 256), ctx)
+        print("✓ LayerNorm without gating passed")
         
-        # Test GPU without bias
-        run_layer_norm_gated_gpu[DType.float32, has_z=True, has_bias=False, is_rms_norm=False, norm_before_gate=True](Index(5), ctx)
+        # Test GPU LayerNorm without bias
         run_layer_norm_gated_gpu[DType.float32, has_z=True, has_bias=False, is_rms_norm=False, norm_before_gate=True](Index(2, 128), ctx)
+        run_layer_norm_gated_gpu[DType.float32, has_z=True, has_bias=False, is_rms_norm=False, norm_before_gate=True](Index(4, 256), ctx)
+        print("✓ LayerNorm without bias passed")
 

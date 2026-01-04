@@ -2176,11 +2176,9 @@ fn rms_norm_fused_residual_cpu[
     fn intermediate_output_fn[
         width: Int, alignment: Int
     ](idx: IndexList[rank], val: SIMD[dtype, width]) -> None:
-        var residual_val = residual_input_fn[width](idx)
-        var residual_add_val = val + residual_val
-        
+        # val already contains (input + residual) from the calling loop
         # Output the pre-normalized value (x + residual) for prenorm mode
-        output_residual_fn[width, alignment](idx, residual_add_val)
+        output_residual_fn[width, alignment](idx, val)
         
         # Store in intermediate buffer for RMSNorm
         var intermediate_idx = intermediate_buffer.runtime_layout(
@@ -2189,7 +2187,7 @@ fn rms_norm_fused_residual_cpu[
             ](idx)
         )
         intermediate_buffer.ptr.store[width=width, alignment=alignment](
-            intermediate_idx, residual_add_val
+            intermediate_idx, val
         )
 
     # Manually iterate through all elements to add residual to input
@@ -3316,13 +3314,21 @@ fn layer_norm_gated_gpu_warp_tiling[
         # thread_idx 0 to update the final row mean and variance
         var norm_factor: Scalar[accum_type]
         if is_rms_norm:
-            # For RMSNorm, compute mean of squares
+            # For RMSNorm, compute mean of squares and broadcast via shared memory
+            var m2_broadcast = stack_allocation[
+                1, accum_type, address_space = AddressSpace.SHARED
+            ]()
+            var count_broadcast = stack_allocation[
+                1, accum_type, address_space = AddressSpace.SHARED
+            ]()
             var block_m2 = block_reduce[accum_type, max_warps_per_block](thread_m2)
             var block_count = block_reduce[accum_type, max_warps_per_block](thread_count)
             if tid == 0:
-                row_m2 = block_m2
-                row_count = block_count
+                m2_broadcast.store(0, block_m2)
+                count_broadcast.store(0, block_count)
             barrier()
+            row_m2 = m2_broadcast.load(0)
+            row_count = count_broadcast.load(0)
             var row_var = row_m2 / row_count
             norm_factor = rsqrt(row_var + epsilon.cast[accum_type]())
         else:
@@ -3468,12 +3474,21 @@ fn layer_norm_gated_gpu_block[
             # A whole block computes part of the row mean and variance and broadcasts to
             # thread_idx 0 to update the final row mean and variance
             if is_rms_norm:
+                # Use shared memory to broadcast RMSNorm values to all threads
+                var m2_broadcast = stack_allocation[
+                    1, accum_type, address_space = AddressSpace.SHARED
+                ]()
+                var count_broadcast = stack_allocation[
+                    1, accum_type, address_space = AddressSpace.SHARED
+                ]()
                 var block_m2 = block_reduce[accum_type, max_warps_per_block](thread_m2)
                 var block_count = block_reduce[accum_type, max_warps_per_block](thread_count)
                 if tid == 0:
-                    row_m2 = block_m2
-                    row_count = block_count
+                    m2_broadcast.store(0, block_m2)
+                    count_broadcast.store(0, block_count)
                 barrier()
+                row_m2 = m2_broadcast.load(0)
+                row_count = count_broadcast.load(0)
             else:
                 welford_block_all_reduce(
                     thread_mean,

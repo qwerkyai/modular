@@ -21,7 +21,7 @@ from layout import (
     LayoutTensor,
     RuntimeLayout,
 )
-from layout._fillers import rand
+from random import rand
 from nn.varlen_selective_scan import (
     varlen_selective_scan_fwd_cpu,
     varlen_selective_scan_fwd_gpu,
@@ -350,13 +350,13 @@ fn run_varlen_selective_scan_fwd_gpu[
     var has_initial_state_gpu_lt = LayoutTensor[DType.bool, layout_1d, MutAnyOrigin](
         has_initial_state_d, RuntimeLayout[layout_1d].row_major(Index(batch))
     )
-        
-        # Launch GPU kernel
-        comptime BLOCK_SIZE = 128
-        var num_dim_blocks = (dim + BLOCK_SIZE - 1) // BLOCK_SIZE
-        
-        var compiled_kernel = ctx.compile_function_checked[
-            varlen_selective_scan_fwd_gpu[
+    
+    # Launch GPU kernel
+    comptime BLOCK_SIZE = 128
+    var num_dim_blocks = (dim + BLOCK_SIZE - 1) // BLOCK_SIZE
+    
+    var compiled_kernel = ctx.compile_function_checked[
+        varlen_selective_scan_fwd_gpu[
                 dtype,
                 u_gpu_lt.layout,
                 delta_gpu_lt.layout,
@@ -389,9 +389,9 @@ fn run_varlen_selective_scan_fwd_gpu[
                 has_initial_state_gpu_lt.layout,
             ]
         ]()
-        
-        ctx.enqueue_function_checked(
-            compiled_kernel,
+    
+    ctx.enqueue_function_checked(
+        compiled_kernel,
             dim,
             dstate,
             ngroups,

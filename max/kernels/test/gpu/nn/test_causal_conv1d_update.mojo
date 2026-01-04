@@ -23,7 +23,7 @@ from layout import (
     RuntimeTuple,
     RuntimeLayout,
 )
-from layout._fillers import rand
+from random import rand
 from layout.int_tuple import fill_like
 from memory import alloc
 from nn.causal_conv1d import (
@@ -58,8 +58,8 @@ fn run_causal_conv1d_update_gpu[
     seqlen: Int,
     width: Int,
     state_len: Int,
-    rtol: Float64 = 0.01,
     ctx: DeviceContext,
+    rtol: Float64 = 0.01,
 ) raises:
     """Test causal conv1d update GPU kernel against CPU reference."""
     # Allocate host memory
@@ -69,25 +69,25 @@ fn run_causal_conv1d_update_gpu[
     
     # Input x: (B, C, L)
     var input_heap = alloc[Scalar[dtype]](batch * dim * seqlen)
-    var input_h = LayoutTensor[dtype, layout_3d](
+    var input_h = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
         input_heap, RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen))
     )
     
     # Conv state: (B, C, S)
     var conv_state_heap = alloc[Scalar[dtype]](batch * dim * state_len)
-    var conv_state_h = LayoutTensor[dtype, layout_3d](
+    var conv_state_h = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
         conv_state_heap, RuntimeLayout[layout_3d].row_major(Index(batch, dim, state_len))
     )
     
     # Weight: (C, W)
     var weight_heap = alloc[Scalar[dtype]](dim * width)
-    var weight_h = LayoutTensor[dtype, layout_2d](
+    var weight_h = LayoutTensor[dtype, layout_2d, MutAnyOrigin](
         weight_heap, RuntimeLayout[layout_2d].row_major(Index(dim, width))
     )
     
     # Bias: (C,)
     var bias_heap = alloc[Scalar[dtype]](dim)
-    var bias_h = LayoutTensor[dtype, layout_1d](
+    var bias_h = LayoutTensor[dtype, layout_1d, MutAnyOrigin](
         bias_heap, RuntimeLayout[layout_1d].row_major(Index(dim))
     )
     
@@ -98,13 +98,13 @@ fn run_causal_conv1d_update_gpu[
     ).fill(0)
     
     var result_cpu_heap = alloc[Scalar[dtype]](batch * dim * seqlen)
-    var result_cpu_h = LayoutTensor[dtype, layout_3d](
+    var result_cpu_h = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
         result_cpu_heap, RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen))
     ).fill(0)
     
     # Copy of conv_state for CPU reference
     var conv_state_cpu_heap = alloc[Scalar[dtype]](batch * dim * state_len)
-    var conv_state_cpu_h = LayoutTensor[dtype, layout_3d](
+    var conv_state_cpu_h = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
         conv_state_cpu_heap, RuntimeLayout[layout_3d].row_major(Index(batch, dim, state_len))
     )
     
@@ -115,10 +115,10 @@ fn run_causal_conv1d_update_gpu[
     )
     
     # Initialize input data
-    rand(input_h)
-    rand(conv_state_h)
-    rand(weight_h)
-    rand(bias_h)
+    rand[dtype](input_h.ptr, input_h.size())
+    rand[dtype](conv_state_h.ptr, conv_state_h.size())
+    rand[dtype](weight_h.ptr, weight_h.size())
+    rand[dtype](bias_h.ptr, bias_h.size())
     
     # Copy conv_state for CPU and GPU
     for i in range(batch * dim * state_len):

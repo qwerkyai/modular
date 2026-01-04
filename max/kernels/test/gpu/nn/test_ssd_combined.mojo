@@ -21,7 +21,7 @@ from layout import (
     LayoutTensor,
     RuntimeLayout,
 )
-from layout._fillers import rand
+from random import rand
 from nn.selective_scan import (
     ssd_combined_cpu,
     ssd_combined_gpu,
@@ -79,7 +79,6 @@ fn run_ssd_combined_gpu[
     var delta_bias_size = dim if has_delta_bias else 0
     var delta_bias_h = UnsafePointer[Scalar[dtype]].alloc(max(delta_bias_size, 1))
     var gamma_h = UnsafePointer[Scalar[dtype]].alloc(dim)
-    var gamma_h = UnsafePointer[Scalar[dtype]].alloc(dim)
     
     # Create LayoutTensors for initialization
     var u_init = LayoutTensor[dtype, layout_3d](
@@ -114,41 +113,41 @@ fn run_ssd_combined_gpu[
     )
     
     # Initialize with random data
-    rand(u_init)
-    rand(delta_init)
-    rand(residual_init)
-    rand(A_init)
-    rand(B_init)
-    rand(C_init)
+    rand[dtype](u_init.ptr, u_init.size())
+    rand[dtype](delta_init.ptr, delta_init.size())
+    rand[dtype](residual_init.ptr, residual_init.size())
+    rand[dtype](A_init.ptr, A_init.size())
+    rand[dtype](B_init.ptr, B_init.size())
+    rand[dtype](C_init.ptr, C_init.size())
     if has_D:
-        rand(D_init)
+        rand[dtype](D_init.ptr, D_init.size())
     if has_z:
-        rand(z_init)
+        rand[dtype](z_init.ptr, z_init.size())
     if has_delta_bias:
-        rand(delta_bias_init)
-    rand(gamma_init)
+        rand[dtype](delta_bias_init.ptr, delta_bias_init.size())
+    rand[dtype](gamma_init.ptr, gamma_init.size())
     
     # Initialize gamma to positive values
     for i in range(dim):
         gamma_h[i] = abs(gamma_h[i]) + Scalar[dtype](0.1)
     
     # Allocate GPU memory
-    var output_cpu_gpu = ctx.alloc[Scalar[dtype]](batch * dim * seqlen)
-    var output_gpu_gpu = ctx.alloc[Scalar[dtype]](batch * dim * seqlen)
-    var x_cpu_gpu = ctx.alloc[Scalar[dtype]](batch * dim * n_chunks * 2 * dstate)
-    var x_gpu_gpu = ctx.alloc[Scalar[dtype]](batch * dim * n_chunks * 2 * dstate)
-    var out_z_cpu_gpu = ctx.alloc[Scalar[dtype]](batch * dim * seqlen)
-    var out_z_gpu_gpu = ctx.alloc[Scalar[dtype]](batch * dim * seqlen)
-    var residual_gpu = ctx.alloc[Scalar[dtype]](batch * dim * seqlen)
-    var u_gpu = ctx.alloc[Scalar[dtype]](batch * dim * seqlen)
-    var delta_gpu = ctx.alloc[Scalar[dtype]](batch * dim * seqlen)
-    var A_gpu = ctx.alloc[Scalar[dtype]](dim * dstate)
-    var B_gpu = ctx.alloc[Scalar[dtype]](batch * n_groups * dstate * seqlen)
-    var C_gpu = ctx.alloc[Scalar[dtype]](batch * n_groups * dstate * seqlen)
-    var D_gpu = ctx.alloc[Scalar[dtype]](max(D_size, 1))
-    var z_gpu = ctx.alloc[Scalar[dtype]](max(z_size, 1))
-    var delta_bias_gpu = ctx.alloc[Scalar[dtype]](max(delta_bias_size, 1))
-    var gamma_gpu = ctx.alloc[Scalar[dtype]](dim)
+    var output_cpu_gpu = ctx.enqueue_create_buffer[dtype](batch * dim * seqlen)
+    var output_gpu_gpu = ctx.enqueue_create_buffer[dtype](batch * dim * seqlen)
+    var x_cpu_gpu = ctx.enqueue_create_buffer[dtype](batch * dim * n_chunks * 2 * dstate)
+    var x_gpu_gpu = ctx.enqueue_create_buffer[dtype](batch * dim * n_chunks * 2 * dstate)
+    var out_z_cpu_gpu = ctx.enqueue_create_buffer[dtype](batch * dim * seqlen)
+    var out_z_gpu_gpu = ctx.enqueue_create_buffer[dtype](batch * dim * seqlen)
+    var residual_gpu = ctx.enqueue_create_buffer[dtype](batch * dim * seqlen)
+    var u_gpu = ctx.enqueue_create_buffer[dtype](batch * dim * seqlen)
+    var delta_gpu = ctx.enqueue_create_buffer[dtype](batch * dim * seqlen)
+    var A_gpu = ctx.enqueue_create_buffer[dtype](dim * dstate)
+    var B_gpu = ctx.enqueue_create_buffer[dtype](batch * n_groups * dstate * seqlen)
+    var C_gpu = ctx.enqueue_create_buffer[dtype](batch * n_groups * dstate * seqlen)
+    var D_gpu = ctx.enqueue_create_buffer[dtype](max(D_size, 1))
+    var z_gpu = ctx.enqueue_create_buffer[dtype](max(z_size, 1))
+    var delta_bias_gpu = ctx.enqueue_create_buffer[dtype](max(delta_bias_size, 1))
+    var gamma_gpu = ctx.enqueue_create_buffer[dtype](dim)
     
     # Copy to GPU
     ctx.memcpy_h2d(output_cpu_gpu, output_cpu_h, batch * dim * seqlen * size_of[dtype]())
@@ -472,22 +471,23 @@ fn run_ssd_combined_gpu[
     z_h.free()
     delta_bias_h.free()
     gamma_h.free()
-    ctx.free(output_cpu_gpu)
-    ctx.free(output_gpu_gpu)
-    ctx.free(x_cpu_gpu)
-    ctx.free(x_gpu_gpu)
-    ctx.free(out_z_cpu_gpu)
-    ctx.free(out_z_gpu_gpu)
-    ctx.free(residual_gpu)
-    ctx.free(u_gpu)
-    ctx.free(delta_gpu)
-    ctx.free(A_gpu)
-    ctx.free(B_gpu)
-    ctx.free(C_gpu)
-    ctx.free(D_gpu)
-    ctx.free(z_gpu)
-    ctx.free(delta_bias_gpu)
-    ctx.free(gamma_gpu)
+    # Device buffers are automatically freed when they go out of scope
+    _ = output_cpu_gpu^
+    _ = output_gpu_gpu^
+    _ = x_cpu_gpu^
+    _ = x_gpu_gpu^
+    _ = out_z_cpu_gpu^
+    _ = out_z_gpu_gpu^
+    _ = residual_gpu^
+    _ = u_gpu^
+    _ = delta_gpu^
+    _ = A_gpu^
+    _ = B_gpu^
+    _ = C_gpu^
+    _ = D_gpu^
+    _ = z_gpu^
+    _ = delta_bias_gpu^
+    _ = gamma_gpu^
 
 
 def main() raises:

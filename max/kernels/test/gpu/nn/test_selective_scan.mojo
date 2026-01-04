@@ -21,7 +21,7 @@ from layout import (
     LayoutTensor,
     RuntimeLayout,
 )
-from layout._fillers import rand
+from random import rand
 from nn.selective_scan import (
     selective_scan_fwd_cpu,
     selective_scan_fwd_gpu,
@@ -66,6 +66,16 @@ fn run_selective_scan_gpu[
     var x_gpu_h = UnsafePointer[Scalar[dtype]].alloc(batch * dim * n_chunks * 2 * dstate)
     var out_z_cpu_h = UnsafePointer[Scalar[dtype]].alloc(batch * dim * seqlen)
     var out_z_gpu_h = UnsafePointer[Scalar[dtype]].alloc(batch * dim * seqlen)
+    
+    # Initialize output buffers to zero
+    for i in range(batch * dim * seqlen):
+        output_cpu_h[i] = Scalar[dtype](0)
+        output_gpu_h[i] = Scalar[dtype](0)
+        out_z_cpu_h[i] = Scalar[dtype](0)
+        out_z_gpu_h[i] = Scalar[dtype](0)
+    for i in range(batch * dim * n_chunks * 2 * dstate):
+        x_cpu_h[i] = Scalar[dtype](0)
+        x_gpu_h[i] = Scalar[dtype](0)
     var u_h = UnsafePointer[Scalar[dtype]].alloc(batch * dim * seqlen)
     var delta_h = UnsafePointer[Scalar[dtype]].alloc(batch * dim * seqlen)
     var A_h = UnsafePointer[Scalar[dtype]].alloc(dim * dstate)
@@ -105,17 +115,17 @@ fn run_selective_scan_gpu[
     )
     
     # Initialize input data
-    rand(u_init)
-    rand(delta_init)
-    rand(A_init)
-    rand(B_init)
-    rand(C_init)
+    rand[dtype](u_init.ptr, u_init.size())
+    rand[dtype](delta_init.ptr, delta_init.size())
+    rand[dtype](A_init.ptr, A_init.size())
+    rand[dtype](B_init.ptr, B_init.size())
+    rand[dtype](C_init.ptr, C_init.size())
     if has_D:
-        rand(D_init)
+        rand[dtype](D_init.ptr, D_init.size())
     if has_z:
-        rand(z_init)
+        rand[dtype](z_init.ptr, z_init.size())
     if has_delta_bias:
-        rand(delta_bias_init)
+        rand[dtype](delta_bias_init.ptr, delta_bias_init.size())
     
     # Scale A to be negative for stability
     for i in range(dim * dstate):
@@ -157,39 +167,41 @@ fn run_selective_scan_gpu[
         ctx.enqueue_copy(delta_bias_d, delta_bias_h)
     
     # Create LayoutTensors for CPU
-    var output_cpu_buf = LayoutTensor[dtype, layout_3d](
-        output_cpu_d, RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen))
+    # Create CPU LayoutTensors with MutAnyOrigin for CPU function (using host memory)
+    var output_cpu_buf = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
+        output_cpu_h, RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen))
     )
-    var x_cpu_buf = LayoutTensor[dtype, layout_4d](
-        x_cpu_d, RuntimeLayout[layout_4d].row_major(Index(batch, dim, n_chunks, 2 * dstate))
+    var x_cpu_buf = LayoutTensor[dtype, layout_4d, MutAnyOrigin](
+        x_cpu_h, RuntimeLayout[layout_4d].row_major(Index(batch, dim, n_chunks, 2 * dstate))
     )
-    var out_z_cpu_buf = LayoutTensor[dtype, layout_3d](
-        out_z_cpu_d, RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen))
+    var out_z_cpu_buf = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
+        out_z_cpu_h, RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen))
     )
-    var u_cpu_buf = LayoutTensor[dtype, layout_3d](
-        u_d, RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen))
+    var u_cpu_buf = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
+        u_h, RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen))
     )
-    var delta_cpu_buf = LayoutTensor[dtype, layout_3d](
-        delta_d, RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen))
+    var delta_cpu_buf = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
+        delta_h, RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen))
     )
-    var A_cpu_buf = LayoutTensor[dtype, layout_2d](
-        A_d, RuntimeLayout[layout_2d].row_major(Index(dim, dstate))
+    var A_cpu_buf = LayoutTensor[dtype, layout_2d, MutAnyOrigin](
+        A_h, RuntimeLayout[layout_2d].row_major(Index(dim, dstate))
     )
-    var B_cpu_buf = LayoutTensor[dtype, layout_4d](
-        B_d, RuntimeLayout[layout_4d].row_major(Index(batch, n_groups, dstate, seqlen))
+    var B_cpu_buf = LayoutTensor[dtype, layout_4d, MutAnyOrigin](
+        B_h, RuntimeLayout[layout_4d].row_major(Index(batch, n_groups, dstate, seqlen))
     )
-    var C_cpu_buf = LayoutTensor[dtype, layout_4d](
-        C_d, RuntimeLayout[layout_4d].row_major(Index(batch, n_groups, dstate, seqlen))
+    var C_cpu_buf = LayoutTensor[dtype, layout_4d, MutAnyOrigin](
+        C_h, RuntimeLayout[layout_4d].row_major(Index(batch, n_groups, dstate, seqlen))
     )
-    var D_cpu_buf = LayoutTensor[dtype, layout_1d](
-        D_d, RuntimeLayout[layout_1d].row_major(Index(D_size))
+    var D_cpu_buf = LayoutTensor[dtype, layout_1d, MutAnyOrigin](
+        D_h, RuntimeLayout[layout_1d].row_major(Index(D_size))
     )
-    var z_cpu_buf = LayoutTensor[dtype, layout_3d](
-        z_d, RuntimeLayout[layout_3d].row_major(Index(batch if has_z else 0, dim if has_z else 0, seqlen if has_z else 0))
+    var z_cpu_buf = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
+        z_h, RuntimeLayout[layout_3d].row_major(Index(batch if has_z else 0, dim if has_z else 0, seqlen if has_z else 0))
     )
-    var delta_bias_cpu_buf = LayoutTensor[dtype, layout_1d](
-        delta_bias_d, RuntimeLayout[layout_1d].row_major(Index(delta_bias_size))
+    var delta_bias_cpu_buf = LayoutTensor[dtype, layout_1d, MutAnyOrigin](
+        delta_bias_h, RuntimeLayout[layout_1d].row_major(Index(delta_bias_size))
     )
+    
     
     # Create LayoutTensors for GPU
     var output_gpu_buf = LayoutTensor[dtype, layout_3d](
@@ -418,9 +430,9 @@ fn run_selective_scan_gpu[
         block_dim=(BLOCK_SIZE,),
     )
     
-    # Copy results back
-    ctx.enqueue_copy(output_cpu_h, output_cpu_d)
+    # Copy GPU results back (CPU results are already in output_cpu_h)
     ctx.enqueue_copy(output_gpu_h, output_gpu_d)
+    ctx.synchronize()
     
     # Compare results
     var flattened_size = batch * dim * seqlen

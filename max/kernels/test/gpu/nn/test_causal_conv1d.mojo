@@ -11,7 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from math import exp
+from math import ceildiv, exp
 from sys.info import simd_width_of
 
 from algorithm.functional import _get_start_indices_of_nth_subvolume
@@ -23,7 +23,7 @@ from layout import (
     RuntimeTuple,
     RuntimeLayout,
 )
-from layout._fillers import rand
+from random import rand
 from layout.int_tuple import fill_like
 from memory import alloc
 from nn.causal_conv1d import (
@@ -54,8 +54,8 @@ fn run_causal_conv1d_gpu[
     dim: Int,
     seqlen: Int,
     width: Int,
-    rtol: Float64 = 0.01,
     ctx: DeviceContext,
+    rtol: Float64 = 0.01,
 ) raises:
     """Test causal conv1d GPU kernel against CPU reference."""
     # Allocate host memory
@@ -64,15 +64,15 @@ fn run_causal_conv1d_gpu[
     comptime layout_1d = Layout(UNKNOWN_VALUE)
     
     var input_heap = alloc[Scalar[dtype]](batch * dim * seqlen)
-    var input_h = LayoutTensor[dtype, layout_3d](
+    var input_h = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
         input_heap, RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen))
     )
     var weight_heap = alloc[Scalar[dtype]](dim * width)
-    var weight_h = LayoutTensor[dtype, layout_2d](
+    var weight_h = LayoutTensor[dtype, layout_2d, MutAnyOrigin](
         weight_heap, RuntimeLayout[layout_2d].row_major(Index(dim, width))
     )
     var bias_heap = alloc[Scalar[dtype]](dim)
-    var bias_h = LayoutTensor[dtype, layout_1d](
+    var bias_h = LayoutTensor[dtype, layout_1d, MutAnyOrigin](
         bias_heap, RuntimeLayout[layout_1d].row_major(Index(dim))
     )
     var result_gpu_heap = alloc[Scalar[dtype]](batch * dim * seqlen)
@@ -80,14 +80,14 @@ fn run_causal_conv1d_gpu[
         result_gpu_heap, RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen))
     ).fill(0)
     var result_cpu_heap = alloc[Scalar[dtype]](batch * dim * seqlen)
-    var result_cpu_h = LayoutTensor[dtype, layout_3d](
+    var result_cpu_h = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
         result_cpu_heap, RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen))
     ).fill(0)
     
     # Initialize input data
-    rand(input_h)
-    rand(weight_h)
-    rand(bias_h)
+    rand[dtype](input_h.ptr, input_h.size())
+    rand[dtype](weight_h.ptr, weight_h.size())
+    rand[dtype](bias_h.ptr, bias_h.size())
     
     var input_buf = input_h
     var weight_buf = weight_h
@@ -137,6 +137,36 @@ fn run_causal_conv1d_gpu[
         silu_activation,
     )
     
+    # Allocate device buffers
+    var input_device = ctx.enqueue_create_buffer[dtype](batch * dim * seqlen)
+    var weight_device = ctx.enqueue_create_buffer[dtype](dim * width)
+    var bias_device = ctx.enqueue_create_buffer[dtype](dim)
+    var output_device = ctx.enqueue_create_buffer[dtype](batch * dim * seqlen)
+    
+    # Copy data to device
+    with ctx.push_context():
+        ctx.enqueue_copy(input_device, input_buf.ptr)
+        ctx.enqueue_copy(weight_device, weight_buf.ptr)
+        ctx.enqueue_copy(bias_device, bias_buf.ptr)
+    
+    # Create device LayoutTensors
+    var input_device_tensor = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
+        input_device.unsafe_ptr(),
+        RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen)),
+    )
+    var weight_device_tensor = LayoutTensor[dtype, layout_2d, MutAnyOrigin](
+        weight_device.unsafe_ptr(),
+        RuntimeLayout[layout_2d].row_major(Index(dim, width)),
+    )
+    var bias_device_tensor = LayoutTensor[dtype, layout_1d, MutAnyOrigin](
+        bias_device.unsafe_ptr(),
+        RuntimeLayout[layout_1d].row_major(Index(dim)),
+    )
+    var output_device_tensor = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
+        output_device.unsafe_ptr(),
+        RuntimeLayout[layout_3d].row_major(Index(batch, dim, seqlen)),
+    )
+    
     # Run GPU kernel
     comptime kNThreads = 128
     comptime kNElts = 4
@@ -145,219 +175,225 @@ fn run_causal_conv1d_gpu[
         comptime kWidth = 1
         var compiled_func = ctx.compile_function_checked[
             causal_conv1d_channel_first_fwd_gpu[
-                input_buf.dtype,
-                input_buf.layout,
-                weight_buf.dtype,
-                weight_buf.layout,
-                result_gpu_buf.dtype,
-                result_gpu_buf.layout,
+                input_device_tensor.dtype,
+                input_device_tensor.layout,
+                weight_device_tensor.dtype,
+                weight_device_tensor.layout,
+                output_device_tensor.dtype,
+                output_device_tensor.layout,
                 kNThreads,
                 kWidth,
                 kNElts,
-                bias_buf.dtype,
-                bias_buf.layout,
+                bias_device_tensor.dtype,
+                bias_device_tensor.layout,
             ],
             causal_conv1d_channel_first_fwd_gpu[
-                input_buf.dtype,
-                input_buf.layout,
-                weight_buf.dtype,
-                weight_buf.layout,
-                result_gpu_buf.dtype,
-                result_gpu_buf.layout,
+                input_device_tensor.dtype,
+                input_device_tensor.layout,
+                weight_device_tensor.dtype,
+                weight_device_tensor.layout,
+                output_device_tensor.dtype,
+                output_device_tensor.layout,
                 kNThreads,
                 kWidth,
                 kNElts,
-                bias_buf.dtype,
-                bias_buf.layout,
+                bias_device_tensor.dtype,
+                bias_device_tensor.layout,
             ],
         ]()
         var silu_activation_int8 = Int8(silu_activation)
-        ctx.enqueue_function_checked(
-            compiled_func,
-            batch,
-            dim,
-            seqlen,
-            width,
-            input_buf,
-            weight_buf,
-            result_gpu_buf,
-            bias_buf,
-            x_batch_stride,
-            x_c_stride,
-            x_l_stride,
-            weight_c_stride,
-            weight_width_stride,
-            out_batch_stride,
-            out_c_stride,
-            out_l_stride,
-            silu_activation_int8,
-            grid_dim=(ceildiv(input_buf.dim(2), kNThreads * kNElts), input_buf.dim(1), input_buf.dim(0)),
-            block_dim=(kNThreads),
-        )
+        with ctx.push_context():
+            ctx.enqueue_function_checked(
+                compiled_func,
+                batch,
+                dim,
+                seqlen,
+                width,
+                input_device_tensor,
+                weight_device_tensor,
+                output_device_tensor,
+                bias_device_tensor,
+                x_batch_stride,
+                x_c_stride,
+                x_l_stride,
+                weight_c_stride,
+                weight_width_stride,
+                out_batch_stride,
+                out_c_stride,
+                out_l_stride,
+                silu_activation_int8,
+                grid_dim=(ceildiv(seqlen, kNThreads * kNElts), dim, batch),
+                block_dim=(kNThreads),
+            )
     elif width == 2:
         comptime kWidth = 2
         var compiled_func = ctx.compile_function_checked[
             causal_conv1d_channel_first_fwd_gpu[
-                input_buf.dtype,
-                input_buf.layout,
-                weight_buf.dtype,
-                weight_buf.layout,
-                result_gpu_buf.dtype,
-                result_gpu_buf.layout,
+                input_device_tensor.dtype,
+                input_device_tensor.layout,
+                weight_device_tensor.dtype,
+                weight_device_tensor.layout,
+                output_device_tensor.dtype,
+                output_device_tensor.layout,
                 kNThreads,
                 kWidth,
                 kNElts,
-                bias_buf.dtype,
-                bias_buf.layout,
+                bias_device_tensor.dtype,
+                bias_device_tensor.layout,
             ],
             causal_conv1d_channel_first_fwd_gpu[
-                input_buf.dtype,
-                input_buf.layout,
-                weight_buf.dtype,
-                weight_buf.layout,
-                result_gpu_buf.dtype,
-                result_gpu_buf.layout,
+                input_device_tensor.dtype,
+                input_device_tensor.layout,
+                weight_device_tensor.dtype,
+                weight_device_tensor.layout,
+                output_device_tensor.dtype,
+                output_device_tensor.layout,
                 kNThreads,
                 kWidth,
                 kNElts,
-                bias_buf.dtype,
-                bias_buf.layout,
+                bias_device_tensor.dtype,
+                bias_device_tensor.layout,
             ],
         ]()
         var silu_activation_int8 = Int8(silu_activation)
-        ctx.enqueue_function_checked(
-            compiled_func,
-            batch,
-            dim,
-            seqlen,
-            width,
-            input_buf,
-            weight_buf,
-            result_gpu_buf,
-            bias_buf,
-            x_batch_stride,
-            x_c_stride,
-            x_l_stride,
-            weight_c_stride,
-            weight_width_stride,
-            out_batch_stride,
-            out_c_stride,
-            out_l_stride,
-            silu_activation_int8,
-            grid_dim=(ceildiv(input_buf.dim(2), kNThreads * kNElts), input_buf.dim(1), input_buf.dim(0)),
-            block_dim=(kNThreads),
-        )
+        with ctx.push_context():
+            ctx.enqueue_function_checked(
+                compiled_func,
+                batch,
+                dim,
+                seqlen,
+                width,
+                input_device_tensor,
+                weight_device_tensor,
+                output_device_tensor,
+                bias_device_tensor,
+                x_batch_stride,
+                x_c_stride,
+                x_l_stride,
+                weight_c_stride,
+                weight_width_stride,
+                out_batch_stride,
+                out_c_stride,
+                out_l_stride,
+                silu_activation_int8,
+                grid_dim=(ceildiv(seqlen, kNThreads * kNElts), dim, batch),
+                block_dim=(kNThreads),
+            )
     elif width == 3:
         comptime kWidth = 3
         var compiled_func = ctx.compile_function_checked[
             causal_conv1d_channel_first_fwd_gpu[
-                input_buf.dtype,
-                input_buf.layout,
-                weight_buf.dtype,
-                weight_buf.layout,
-                result_gpu_buf.dtype,
-                result_gpu_buf.layout,
+                input_device_tensor.dtype,
+                input_device_tensor.layout,
+                weight_device_tensor.dtype,
+                weight_device_tensor.layout,
+                output_device_tensor.dtype,
+                output_device_tensor.layout,
                 kNThreads,
                 kWidth,
                 kNElts,
-                bias_buf.dtype,
-                bias_buf.layout,
+                bias_device_tensor.dtype,
+                bias_device_tensor.layout,
             ],
             causal_conv1d_channel_first_fwd_gpu[
-                input_buf.dtype,
-                input_buf.layout,
-                weight_buf.dtype,
-                weight_buf.layout,
-                result_gpu_buf.dtype,
-                result_gpu_buf.layout,
+                input_device_tensor.dtype,
+                input_device_tensor.layout,
+                weight_device_tensor.dtype,
+                weight_device_tensor.layout,
+                output_device_tensor.dtype,
+                output_device_tensor.layout,
                 kNThreads,
                 kWidth,
                 kNElts,
-                bias_buf.dtype,
-                bias_buf.layout,
+                bias_device_tensor.dtype,
+                bias_device_tensor.layout,
             ],
         ]()
         var silu_activation_int8 = Int8(silu_activation)
-        ctx.enqueue_function_checked(
-            compiled_func,
-            batch,
-            dim,
-            seqlen,
-            width,
-            input_buf,
-            weight_buf,
-            result_gpu_buf,
-            bias_buf,
-            x_batch_stride,
-            x_c_stride,
-            x_l_stride,
-            weight_c_stride,
-            weight_width_stride,
-            out_batch_stride,
-            out_c_stride,
-            out_l_stride,
-            silu_activation_int8,
-            grid_dim=(ceildiv(input_buf.dim(2), kNThreads * kNElts), input_buf.dim(1), input_buf.dim(0)),
-            block_dim=(kNThreads),
-        )
+        with ctx.push_context():
+            ctx.enqueue_function_checked(
+                compiled_func,
+                batch,
+                dim,
+                seqlen,
+                width,
+                input_device_tensor,
+                weight_device_tensor,
+                output_device_tensor,
+                bias_device_tensor,
+                x_batch_stride,
+                x_c_stride,
+                x_l_stride,
+                weight_c_stride,
+                weight_width_stride,
+                out_batch_stride,
+                out_c_stride,
+                out_l_stride,
+                silu_activation_int8,
+                grid_dim=(ceildiv(seqlen, kNThreads * kNElts), dim, batch),
+                block_dim=(kNThreads),
+            )
     elif width == 4:
         comptime kWidth = 4
         var compiled_func = ctx.compile_function_checked[
             causal_conv1d_channel_first_fwd_gpu[
-                input_buf.dtype,
-                input_buf.layout,
-                weight_buf.dtype,
-                weight_buf.layout,
-                result_gpu_buf.dtype,
-                result_gpu_buf.layout,
+                input_device_tensor.dtype,
+                input_device_tensor.layout,
+                weight_device_tensor.dtype,
+                weight_device_tensor.layout,
+                output_device_tensor.dtype,
+                output_device_tensor.layout,
                 kNThreads,
                 kWidth,
                 kNElts,
-                bias_buf.dtype,
-                bias_buf.layout,
+                bias_device_tensor.dtype,
+                bias_device_tensor.layout,
             ],
             causal_conv1d_channel_first_fwd_gpu[
-                input_buf.dtype,
-                input_buf.layout,
-                weight_buf.dtype,
-                weight_buf.layout,
-                result_gpu_buf.dtype,
-                result_gpu_buf.layout,
+                input_device_tensor.dtype,
+                input_device_tensor.layout,
+                weight_device_tensor.dtype,
+                weight_device_tensor.layout,
+                output_device_tensor.dtype,
+                output_device_tensor.layout,
                 kNThreads,
                 kWidth,
                 kNElts,
-                bias_buf.dtype,
-                bias_buf.layout,
+                bias_device_tensor.dtype,
+                bias_device_tensor.layout,
             ],
         ]()
         var silu_activation_int8 = Int8(silu_activation)
-        ctx.enqueue_function_checked(
-            compiled_func,
-            batch,
-            dim,
-            seqlen,
-            width,
-            input_buf,
-            weight_buf,
-            result_gpu_buf,
-            bias_buf,
-            x_batch_stride,
-            x_c_stride,
-            x_l_stride,
-            weight_c_stride,
-            weight_width_stride,
-            out_batch_stride,
-            out_c_stride,
-            out_l_stride,
-            silu_activation_int8,
-            grid_dim=(ceildiv(input_buf.dim(2), kNThreads * kNElts), input_buf.dim(1), input_buf.dim(0)),
-            block_dim=(kNThreads),
-        )
+        with ctx.push_context():
+            ctx.enqueue_function_checked(
+                compiled_func,
+                batch,
+                dim,
+                seqlen,
+                width,
+                input_device_tensor,
+                weight_device_tensor,
+                output_device_tensor,
+                bias_device_tensor,
+                x_batch_stride,
+                x_c_stride,
+                x_l_stride,
+                weight_c_stride,
+                weight_width_stride,
+                out_batch_stride,
+                out_c_stride,
+                out_l_stride,
+                silu_activation_int8,
+                grid_dim=(ceildiv(seqlen, kNThreads * kNElts), dim, batch),
+                block_dim=(kNThreads),
+            )
     else:
         raise Error("Unsupported kernel width: only widths 1, 2, 3, 4 are supported")
     
-    # Synchronize GPU
-    ctx.sync()
+    # Copy GPU results back to host
+    with ctx.push_context():
+        ctx.enqueue_copy(result_gpu_h.ptr, output_device)
+    ctx.synchronize()
     
     # Compare results
     var flattened_size = batch * dim * seqlen
