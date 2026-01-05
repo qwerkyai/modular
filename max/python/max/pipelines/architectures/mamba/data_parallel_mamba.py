@@ -31,7 +31,6 @@ from max.graph import (
 )
 from max.nn import Module
 from max.nn.data_parallelism import split_batch
-from max.nn.kv_cache import KVCacheParams, PagedCacheValues
 from max.pipelines.lib.lora import LoRAManager
 
 from .mamba import Mamba
@@ -76,7 +75,6 @@ class DataParallelMamba(Module):
     # Graph helpers.
     def input_types(
         self,
-        kv_params: KVCacheParams,
         lora_manager: LoRAManager | None,
     ) -> tuple[TensorType | BufferType, ...]:
         """Creates input tensor types used for building the graph.
@@ -88,31 +86,22 @@ class DataParallelMamba(Module):
         - tokens: Tensor of shape [total_seq_len]
         - input_row_offsets: Tensor of shape [batch_size + 1]
         - return_n_logits: Tensor of shape [1]
-        - kv_cache_inputs: list of KV cache inputs.
 
         This class's `__call__` method expects the inputs above for each device.
 
         The input types defined here, however, are the same as the input types
         as the single device model except for:
         - an additional input for the data_parallel_splits tensor
-        - the kv_cache_inputs replicated for each device.
 
         In `_call_flat`, the data_parallel_splits tensor is used to split the
         tokens and input_row_offsets into data parallel splits.
         """
-        inputs = []
-        single_model_inputs = self.model.input_types(kv_params, lora_manager)
+        single_model_inputs = self.model.input_types(lora_manager)
         (
             token_type,
             input_row_offsets_type,
             return_n_logits_type,
-            *single_model_kv_cache_inputs,
         ) = single_model_inputs
-        self.num_kv_cache_inputs = len(single_model_kv_cache_inputs)
-
-        flat_kv_cache_inputs: list[TensorType] = []
-        for input_symbols in kv_params.get_symbolic_inputs():
-            flat_kv_cache_inputs.extend(input_symbols)
 
         data_parallel_split_type = TensorType(
             DType.int64,
@@ -125,7 +114,6 @@ class DataParallelMamba(Module):
             input_row_offsets_type,
             return_n_logits_type,
             data_parallel_split_type,
-            *flat_kv_cache_inputs,
         ]
         return tuple(inputs)
 
@@ -134,14 +122,12 @@ class DataParallelMamba(Module):
         # inputs that have been flattened.
         # Currently this function requires `input_types` to be called first,
         # in order to unflatten the inputs.
-        assert hasattr(self, "num_kv_cache_inputs")
 
         (
             tokens,
             input_row_offsets,
             return_n_logits,
             data_parallel_splits,
-            *all_kv_cache_inputs,
         ) = args
 
         split_tokens, split_offsets = split_batch(
@@ -154,18 +140,9 @@ class DataParallelMamba(Module):
         all_model_args = []
 
         for i in range(len(self.config.devices)):
-            start_idx = i * self.num_kv_cache_inputs
-            kv_cache_args = PagedCacheValues(
-                kv_blocks=all_kv_cache_inputs[start_idx].buffer,
-                cache_lengths=all_kv_cache_inputs[start_idx + 1].tensor,
-                lookup_table=all_kv_cache_inputs[start_idx + 2].tensor,
-                max_lengths=all_kv_cache_inputs[start_idx + 3].tensor,
-            )
-
             all_model_args.append(
                 (
                     split_tokens[i].tensor,
-                    kv_cache_args,
                     return_n_logits.tensor,
                     split_offsets[i].tensor,
                 )
@@ -186,7 +163,6 @@ def _assign_weight(module: Module, key: str, value: Any) -> None:
 
 def create_graph(
     config: MambaConfig,
-    kv_params: KVCacheParams,
     state_dict: dict[str, Any],
 ) -> tuple[Graph, dict[str, Any]]:
     model = DataParallelMamba(config)
@@ -201,7 +177,7 @@ def create_graph(
         weight_alignment=1,
         strict=True,
     )
-    inputs = model.input_types(kv_params, None)
+    inputs = model.input_types(None)
     with Graph("mamba", input_types=inputs) as graph:
         outputs = model._call_flat(*graph.inputs)
         graph.output(*outputs)

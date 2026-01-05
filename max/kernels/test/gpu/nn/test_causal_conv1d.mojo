@@ -104,6 +104,7 @@ fn run_causal_conv1d_gpu[
     var out_batch_stride: UInt32 = dim * seqlen
     var out_c_stride: UInt32 = seqlen
     var out_l_stride: UInt32 = 1
+    var bias_stride: UInt32 = 1
     
     var silu_activation = activation == "silu"
     
@@ -134,6 +135,7 @@ fn run_causal_conv1d_gpu[
         out_batch_stride,
         out_c_stride,
         out_l_stride,
+        bias_stride,
         silu_activation,
     )
     
@@ -221,6 +223,7 @@ fn run_causal_conv1d_gpu[
                 out_batch_stride,
                 out_c_stride,
                 out_l_stride,
+                bias_stride,
                 silu_activation_int8,
                 grid_dim=(ceildiv(seqlen, kNThreads * kNElts), dim, batch),
                 block_dim=(kNThreads),
@@ -275,6 +278,7 @@ fn run_causal_conv1d_gpu[
                 out_batch_stride,
                 out_c_stride,
                 out_l_stride,
+                bias_stride,
                 silu_activation_int8,
                 grid_dim=(ceildiv(seqlen, kNThreads * kNElts), dim, batch),
                 block_dim=(kNThreads),
@@ -329,6 +333,7 @@ fn run_causal_conv1d_gpu[
                 out_batch_stride,
                 out_c_stride,
                 out_l_stride,
+                bias_stride,
                 silu_activation_int8,
                 grid_dim=(ceildiv(seqlen, kNThreads * kNElts), dim, batch),
                 block_dim=(kNThreads),
@@ -383,6 +388,7 @@ fn run_causal_conv1d_gpu[
                 out_batch_stride,
                 out_c_stride,
                 out_l_stride,
+                bias_stride,
                 silu_activation_int8,
                 grid_dim=(ceildiv(seqlen, kNThreads * kNElts), dim, batch),
                 block_dim=(kNThreads),

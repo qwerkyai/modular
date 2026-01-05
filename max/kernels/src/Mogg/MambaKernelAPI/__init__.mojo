@@ -15,11 +15,18 @@
 This package provides custom operations required for Mamba models:
 - causal_conv1d: Causal 1D convolution with optional SiLU activation
 - selective_scan_fwd: Selective scan forward pass for Mamba SSM
+- rms_norm: Root Mean Square normalization for Mamba blocks
 
 These operations are separated from MOGGKernelAPI to avoid conflicts with
-default kernel registrations (e.g., rms_norm) that are already loaded by
-the MAX runtime.
+default kernel registrations that are already loaded by the MAX runtime.
 """
 
-from .MambaKernelAPI import CausalConv1D, SelectiveScanFwd
+from .MambaKernelAPI import (
+    CausalConv1D,
+    CausalConv1DUpdate,
+    RMSNorm,
+    RMSNormFusedResidual,
+    SelectiveScanFwd,
+    SelectiveScanUpdate,
+)
 

@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""Build a Mamba model that uses continuous or paged kv-caching"""
+"""Build a Mamba model for state-space sequence modeling"""
 
 from __future__ import annotations
 
@@ -19,16 +19,15 @@ from collections.abc import Callable, Sequence
 
 from max.dtype import DType
 from max.graph import DeviceRef, TensorType, TensorValue, ops
-from max.graph.quantization import QuantizationEncoding
 from max.nn import (
     ConstantLayerNorm,
     Embedding,
     LayerList,
     Linear,
     Module,
-    RMSNorm,
+    LayerNorm,
+    FusedRMSNorm
 )
-from max.nn.kv_cache import KVCacheParams, PagedCacheValues
 from max.nn.mamba import Block, MambaSSM
 from max.pipelines.lib.lora import LoRAManager
 
@@ -64,16 +63,10 @@ class Mamba(Module):
 
         # Select linear layer class.
         linear_cls: Callable[..., Linear]
-        if config.quantization_config:
-            from max.nn import GPTQLinear
 
-            linear_cls = functools.partial(
-                GPTQLinear, quantization_config=config.quantization_config
-            )
-        else:
-            linear_cls = functools.partial(
-                Linear, float8_config=config.float8_config
-            )
+        linear_cls = functools.partial(
+            Linear, float8_config=config.float8_config
+        )
 
         # Create Mamba blocks
         layers = []
@@ -89,6 +82,7 @@ class Mamba(Module):
                 conv_bias=True,  # Use conv_bias from config if available
                 conv_kernel=config.conv_kernel,
                 x_proj_dim=config.x_proj_dim,
+                layer_idx=i,  # Pass layer index for inference caching
             )
             layers.append(
                 Block(
@@ -104,10 +98,6 @@ class Mamba(Module):
 
         # Create Embedding and output layers.
         embedding_output_dtype = config.dtype
-        embedding_output_quantization = config.model_quantization_encoding
-        if config.model_quantization_encoding == QuantizationEncoding.GPTQ:
-            embedding_output_dtype = DType.bfloat16
-            embedding_output_quantization = None
         if config.float8_config and config.float8_config.embedding_output_dtype:
             embedding_output_dtype = config.float8_config.embedding_output_dtype
 
@@ -116,14 +106,12 @@ class Mamba(Module):
             config.hidden_size,
             embedding_output_dtype,
             config.devices[0],
-            quantization_encoding=embedding_output_quantization,
         )
         output = Linear(
             config.hidden_size,
             config.vocab_size,
             embedding_output_dtype,
             config.devices[0],
-            quantization_encoding=embedding_output_quantization,
         )
 
         if config.tie_word_embeddings:
@@ -141,7 +129,6 @@ class Mamba(Module):
     def __call__(
         self,
         tokens: TensorValue,
-        kv_collection: PagedCacheValues,
         return_n_logits: TensorValue,
         input_row_offsets: TensorValue,
     ) -> tuple[TensorValue, ...]:
@@ -149,7 +136,6 @@ class Mamba(Module):
         
         Args:
             tokens: Input token IDs.
-            kv_collection: KV cache collection (for compatibility, though Mamba doesn't use KV cache).
             return_n_logits: Number of logits to return.
             input_row_offsets: Row offsets for ragged tensor processing.
             
@@ -183,7 +169,6 @@ class Mamba(Module):
 
     def input_types(
         self,
-        kv_params: KVCacheParams,
         lora_manager: LoRAManager | None,
         needs_hidden_state_input: bool = False,
     ) -> tuple[TensorType, ...]:
@@ -194,8 +179,6 @@ class Mamba(Module):
         return_n_logits_type = TensorType(
             DType.int64, shape=["return_n_logits"], device=DeviceRef.CPU()
         )
-
-        kv_inputs = kv_params.get_symbolic_inputs()
 
         # Construct Graph Inputs
         tokens_type = TensorType(
@@ -228,7 +211,6 @@ class Mamba(Module):
                 batch_seq_len,
                 lora_ids_kv,
                 lora_grouped_offsets_kv,
-                *kv_inputs[0],
             )
 
         if needs_hidden_state_input:
@@ -242,13 +224,11 @@ class Mamba(Module):
                 input_row_offsets_type,
                 return_n_logits_type,
                 hidden_states_type,
-                *kv_inputs[0],
             )
 
         return (
             tokens_type,
             input_row_offsets_type,
             return_n_logits_type,
-            *kv_inputs[0],
         )
 

@@ -458,8 +458,8 @@ fn selective_scan_fwd_gpu[
             
             if is_chunk_boundary or is_last_step:
                 for n in range(dstate):
-                    var x_offset_a = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2) * x_n_stride
-                    var x_offset_b = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2 + 1) * x_n_stride
+                    var x_offset_a = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2) * Int(x_n_stride))
+                    var x_offset_b = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2 + 1) * Int(x_n_stride))
                     x.ptr.offset(x_offset_a).store(Scalar[kernel_dtype](cum_a[n].cast[kernel_dtype]()))
                     x.ptr.offset(x_offset_b).store(Scalar[kernel_dtype](cum_b[n].cast[kernel_dtype]()))
                     cum_a[n] = 1.0
@@ -536,8 +536,8 @@ fn selective_scan_fwd_gpu[
         var is_last_step = (t == seqlen - 1)
         if is_chunk_boundary or is_last_step:
             for n in range(dstate):
-                var x_offset_a = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2) * x_n_stride
-                var x_offset_b = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2 + 1) * x_n_stride
+                var x_offset_a = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2) * Int(x_n_stride))
+                var x_offset_b = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2 + 1) * Int(x_n_stride))
                 x.ptr.offset(x_offset_a).store(Scalar[kernel_dtype](cum_a[n].cast[kernel_dtype]()))
                 x.ptr.offset(x_offset_b).store(Scalar[kernel_dtype](cum_b[n].cast[kernel_dtype]()))
                 cum_a[n] = 1.0
@@ -585,6 +585,7 @@ fn selective_scan_update_gpu[
     batch: Int,
     dim: Int,
     dstate: Int,
+    group_size: Int,
     delta_softplus: Int8,
     # Outputs first (MAX convention)
     state_out: LayoutTensor[kernel_dtype, state_out_layout, MutAnyOrigin],
@@ -616,8 +617,10 @@ fn selective_scan_update_gpu[
     A_d_stride: UInt32,
     A_n_stride: UInt32,
     B_b_stride: UInt32,
+    B_g_stride: UInt32,
     B_n_stride: UInt32,
     C_b_stride: UInt32,
+    C_g_stride: UInt32,
     C_n_stride: UInt32,
     D_stride: UInt32,
     z_b_stride: UInt32,
@@ -655,6 +658,9 @@ fn selective_scan_update_gpu[
     if b >= batch or d >= dim:
         return
     
+    # Compute group_id for this dimension
+    var group_id = d // group_size
+    
     # Load dt value
     var dt_offset = UInt32(b) * dt_b_stride + UInt32(d) * dt_d_stride
     var dt_val = Scalar[kernel_dtype](dt.ptr.offset(dt_offset).load()).cast[DType.float32]()
@@ -684,10 +690,10 @@ fn selective_scan_update_gpu[
     # Compute dA = exp2(A * LOG2E * dt) = exp(A * dt)
     var dA = exp2(A_vals * dt_val)
     
-    # Load B values
+    # Load B values using group_id
     var B_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
     for n in range(dstate):
-        var B_offset = UInt32(b) * B_b_stride + UInt32(n) * B_n_stride
+        var B_offset = UInt32(b) * B_b_stride + UInt32(group_id) * B_g_stride + UInt32(n) * B_n_stride
         B_vals[n] = Scalar[kernel_dtype](B.ptr.offset(B_offset).load()).cast[DType.float32]()
     
     # Compute dB = B * dt
@@ -707,10 +713,10 @@ fn selective_scan_update_gpu[
         var state_offset = UInt32(b) * state_out_b_stride + UInt32(d) * state_out_d_stride + UInt32(n) * state_out_n_stride
         state_out.ptr.offset(state_offset).store(Scalar[kernel_dtype](state_vals[n].cast[kernel_dtype]()))
     
-    # Load C values
+    # Load C values using group_id
     var C_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
     for n in range(dstate):
-        var C_offset = UInt32(b) * C_b_stride + UInt32(n) * C_n_stride
+        var C_offset = UInt32(b) * C_b_stride + UInt32(group_id) * C_g_stride + UInt32(n) * C_n_stride
         C_vals[n] = Scalar[kernel_dtype](C.ptr.offset(C_offset).load()).cast[DType.float32]()
     
     # Compute output: out = sum(state * C, axis=-1)
@@ -752,6 +758,7 @@ fn selective_scan_update_cpu[
     batch: Int,
     dim: Int,
     dstate: Int,
+    group_size: Int,
     delta_softplus: Int8,
     # Outputs first (MAX convention)
     state_out: LayoutTensor[kernel_dtype, state_out_layout, MutAnyOrigin],
@@ -783,8 +790,10 @@ fn selective_scan_update_cpu[
     A_d_stride: UInt32,
     A_n_stride: UInt32,
     B_b_stride: UInt32,
+    B_g_stride: UInt32,
     B_n_stride: UInt32,
     C_b_stride: UInt32,
+    C_g_stride: UInt32,
     C_n_stride: UInt32,
     D_stride: UInt32,
     z_b_stride: UInt32,
@@ -804,6 +813,9 @@ fn selective_scan_update_cpu[
     fn worker(idx: Int):
         var b = idx // dim
         var d = idx % dim
+        
+        # Compute group_id for this dimension
+        var group_id = d // group_size
         
         # Load dt value
         var dt_offset = UInt32(b) * dt_b_stride + UInt32(d) * dt_d_stride
@@ -832,10 +844,10 @@ fn selective_scan_update_cpu[
         # Compute dA
         var dA = exp2(A_vals * dt_val)
         
-        # Load B values
+        # Load B values using group_id
         var B_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
         for n in range(dstate):
-            var B_offset = UInt32(b) * B_b_stride + UInt32(n) * B_n_stride
+            var B_offset = UInt32(b) * B_b_stride + UInt32(group_id) * B_g_stride + UInt32(n) * B_n_stride
             B_vals[n] = Scalar[kernel_dtype](B.ptr.offset(B_offset).load()).cast[DType.float32]()
         
         # Compute dB
@@ -855,10 +867,10 @@ fn selective_scan_update_cpu[
             var state_offset = UInt32(b) * state_out_b_stride + UInt32(d) * state_out_d_stride + UInt32(n) * state_out_n_stride
             state_out.ptr.offset(state_offset).store(Scalar[kernel_dtype](state_vals[n].cast[kernel_dtype]()))
         
-        # Load C values
+        # Load C values using group_id
         var C_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
         for n in range(dstate):
-            var C_offset = UInt32(b) * C_b_stride + UInt32(n) * C_n_stride
+            var C_offset = UInt32(b) * C_b_stride + UInt32(group_id) * C_g_stride + UInt32(n) * C_n_stride
             C_vals[n] = Scalar[kernel_dtype](C.ptr.offset(C_offset).load()).cast[DType.float32]()
         
         # Compute output
@@ -957,6 +969,10 @@ fn selective_scan_fwd_cpu[
         var b = idx // dim
         var d = idx % dim
         
+        # Bounds checking
+        if b >= batch or d >= dim:
+            return
+        
         var group_id = d // group_size
         
         # Local state storage (max dstate 16)
@@ -969,13 +985,13 @@ fn selective_scan_fwd_cpu[
         var has_delta_bias = delta_bias.dim(0) > 0
         var delta_bias_val = Float32(0.0)
         if has_delta_bias:
-            var bias_offset = UInt32(d) * delta_bias_stride
+            var bias_offset = UInt32(d * Int(delta_bias_stride))
             delta_bias_val = Scalar[kernel_dtype](delta_bias.ptr.offset(bias_offset).load()).cast[DType.float32]()
         
         var has_D = D.dim(0) > 0
         var D_val = Float32(0.0)
         if has_D:
-            var D_offset = UInt32(d) * D_stride
+            var D_offset = UInt32(d * Int(D_stride))
             D_val = Scalar[kernel_dtype](D.ptr.offset(D_offset).load()).cast[DType.float32]()
         
         var delta_softplus_bool = Bool(Int(delta_softplus) != 0)
@@ -983,20 +999,20 @@ fn selective_scan_fwd_cpu[
         var has_out_z = out_z.dim(0) > 0
         
         for n in range(dstate):
-            var A_offset = UInt32(d) * A_d_stride + UInt32(n) * A_n_stride
+            var A_offset = UInt32(d * Int(A_d_stride)) + UInt32(n * Int(A_n_stride))
             A_vals[n] = Scalar[kernel_dtype](A.ptr.offset(A_offset).load()).cast[DType.float32]() * LOG2E
 
         var chunk_size = 2048
         var t_in_chunk = 0
         var chunk_idx = 0
         
-        var curr_u_offset = UInt32(b) * u_b_stride + UInt32(d) * u_d_stride
-        var curr_delta_offset = UInt32(b) * delta_b_stride + UInt32(d) * delta_d_stride
-        var curr_output_offset = UInt32(b) * output_b_stride + UInt32(d) * output_d_stride
-        var curr_B_offset = UInt32(b) * B_b_stride + UInt32(group_id) * B_g_stride
-        var curr_C_offset = UInt32(b) * C_b_stride + UInt32(group_id) * C_g_stride
-        var curr_z_offset = UInt32(b) * z_b_stride + UInt32(d) * z_d_stride
-        var curr_out_z_offset = UInt32(b) * out_z_b_stride + UInt32(d) * out_z_d_stride
+        var curr_u_offset = UInt32(b * Int(u_b_stride) + d * Int(u_d_stride))
+        var curr_delta_offset = UInt32(b * Int(delta_b_stride) + d * Int(delta_d_stride))
+        var curr_output_offset = UInt32(b * Int(output_b_stride) + d * Int(output_d_stride))
+        var curr_B_offset = UInt32(b * Int(B_b_stride) + group_id * Int(B_g_stride))
+        var curr_C_offset = UInt32(b * Int(C_b_stride) + group_id * Int(C_g_stride))
+        var curr_z_offset = UInt32(b * Int(z_b_stride) + d * Int(z_d_stride))
+        var curr_out_z_offset = UInt32(b * Int(out_z_b_stride) + d * Int(out_z_d_stride))
         
         comptime TILE_SIZE = 4
         var aligned_seqlen = seqlen - (seqlen % TILE_SIZE)
@@ -1011,20 +1027,20 @@ fn selective_scan_fwd_cpu[
                 u_vec = u.ptr.offset(curr_u_offset).load[width=TILE_SIZE]()
             else:
                 for i in range(TILE_SIZE):
-                    u_vec[i] = u.ptr.offset(curr_u_offset + UInt32(i) * u_t_stride).load()
+                    u_vec[i] = u.ptr.offset(curr_u_offset + UInt32(i * Int(u_t_stride))).load()
                     
             if delta_t_stride == 1:
                 delta_vec = delta.ptr.offset(curr_delta_offset).load[width=TILE_SIZE]()
             else:
                 for i in range(TILE_SIZE):
-                    delta_vec[i] = delta.ptr.offset(curr_delta_offset + UInt32(i) * delta_t_stride).load()
+                    delta_vec[i] = delta.ptr.offset(curr_delta_offset + UInt32(i * Int(delta_t_stride))).load()
                     
             if has_z:
                 if z_t_stride == 1:
                     z_vec = z.ptr.offset(curr_z_offset).load[width=TILE_SIZE]()
                 else:
                     for i in range(TILE_SIZE):
-                        z_vec[i] = z.ptr.offset(curr_z_offset + UInt32(i) * z_t_stride).load()
+                        z_vec[i] = z.ptr.offset(curr_z_offset + UInt32(i * Int(z_t_stride))).load()
             
             for i in range(TILE_SIZE):
                 t_in_chunk += 1
@@ -1044,8 +1060,8 @@ fn selective_scan_fwd_cpu[
                 var C_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
                 
                 for n in range(dstate):
-                    var b_off = curr_B_offset + UInt32(i) * B_t_stride + UInt32(n) * B_n_stride
-                    var c_off = curr_C_offset + UInt32(i) * C_t_stride + UInt32(n) * C_n_stride
+                    var b_off = curr_B_offset + UInt32(i * Int(B_t_stride)) + UInt32(n * Int(B_n_stride))
+                    var c_off = curr_C_offset + UInt32(i * Int(C_t_stride)) + UInt32(n * Int(C_n_stride))
                     
                     B_vals[n] = Scalar[kernel_dtype](B.ptr.offset(b_off).load()).cast[DType.float32]()
                     C_vals[n] = Scalar[kernel_dtype](C.ptr.offset(c_off).load()).cast[DType.float32]()
@@ -1067,10 +1083,10 @@ fn selective_scan_fwd_cpu[
                     var z_val = z_vec[i].cast[DType.float32]()
                     var out_z_val = output_val * silu(z_val)
                     if has_out_z:
-                        var out_z_off = curr_out_z_offset + UInt32(i) * out_z_t_stride
+                        var out_z_off = curr_out_z_offset + UInt32(i * Int(out_z_t_stride))
                         out_z.ptr.offset(out_z_off).store(Scalar[kernel_dtype](out_z_val.cast[kernel_dtype]()))
                 
-                var out_off = curr_output_offset + UInt32(i) * output_t_stride
+                var out_off = curr_output_offset + UInt32(i * Int(output_t_stride))
                 output.ptr.offset(out_off).store(Scalar[kernel_dtype](final_val))
                 
                 var is_chunk_boundary = (t_in_chunk == chunk_size)
@@ -1079,8 +1095,8 @@ fn selective_scan_fwd_cpu[
                 
                 if is_chunk_boundary or is_last_step:
                     for n in range(dstate):
-                        var x_offset_a = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2) * x_n_stride
-                        var x_offset_b = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2 + 1) * x_n_stride
+                        var x_offset_a = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2) * Int(x_n_stride))
+                        var x_offset_b = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2 + 1) * Int(x_n_stride))
                         x.ptr.offset(x_offset_a).store(Scalar[kernel_dtype](cum_a[n].cast[kernel_dtype]()))
                         x.ptr.offset(x_offset_b).store(Scalar[kernel_dtype](cum_b[n].cast[kernel_dtype]()))
                         cum_a[n] = 1.0
@@ -1137,8 +1153,8 @@ fn selective_scan_fwd_cpu[
             var is_last_step = (t == seqlen - 1)
             if is_chunk_boundary or is_last_step:
                 for n in range(dstate):
-                    var x_offset_a = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2) * x_n_stride
-                    var x_offset_b = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2 + 1) * x_n_stride
+                    var x_offset_a = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2) * Int(x_n_stride))
+                    var x_offset_b = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2 + 1) * Int(x_n_stride))
                     x.ptr.offset(x_offset_a).store(Scalar[kernel_dtype](cum_a[n].cast[kernel_dtype]()))
                     x.ptr.offset(x_offset_b).store(Scalar[kernel_dtype](cum_b[n].cast[kernel_dtype]()))
                     cum_a[n] = 1.0
@@ -1397,8 +1413,8 @@ fn ssd_combined_gpu[
             
             if is_chunk_boundary or is_last_step:
                 for n in range(dstate):
-                    var x_offset_a = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2) * x_n_stride
-                    var x_offset_b = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2 + 1) * x_n_stride
+                    var x_offset_a = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2) * Int(x_n_stride))
+                    var x_offset_b = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2 + 1) * Int(x_n_stride))
                     x.ptr.offset(x_offset_a).store(Scalar[kernel_dtype](cum_a[n].cast[kernel_dtype]()))
                     x.ptr.offset(x_offset_b).store(Scalar[kernel_dtype](cum_b[n].cast[kernel_dtype]()))
                     cum_a[n] = 1.0
@@ -1476,8 +1492,8 @@ fn ssd_combined_gpu[
         var is_last_step = (t == seqlen - 1)
         if is_chunk_boundary or is_last_step:
             for n in range(dstate):
-                var x_offset_a = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2) * x_n_stride
-                var x_offset_b = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2 + 1) * x_n_stride
+                var x_offset_a = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2) * Int(x_n_stride))
+                var x_offset_b = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2 + 1) * Int(x_n_stride))
                 x.ptr.offset(x_offset_a).store(Scalar[kernel_dtype](cum_a[n].cast[kernel_dtype]()))
                 x.ptr.offset(x_offset_b).store(Scalar[kernel_dtype](cum_b[n].cast[kernel_dtype]()))
                 cum_a[n] = 1.0
@@ -1705,8 +1721,8 @@ fn ssd_combined_cpu[
                 
                 if is_chunk_boundary or is_last_step:
                     for n in range(dstate):
-                        var x_offset_a = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2) * x_n_stride
-                        var x_offset_b = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2 + 1) * x_n_stride
+                        var x_offset_a = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2) * Int(x_n_stride))
+                        var x_offset_b = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2 + 1) * Int(x_n_stride))
                         x.ptr.offset(x_offset_a).store(Scalar[kernel_dtype](cum_a[n].cast[kernel_dtype]()))
                         x.ptr.offset(x_offset_b).store(Scalar[kernel_dtype](cum_b[n].cast[kernel_dtype]()))
                         cum_a[n] = 1.0
@@ -1783,8 +1799,8 @@ fn ssd_combined_cpu[
             var is_last_step = (t == seqlen - 1)
             if is_chunk_boundary or is_last_step:
                 for n in range(dstate):
-                    var x_offset_a = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2) * x_n_stride
-                    var x_offset_b = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2 + 1) * x_n_stride
+                    var x_offset_a = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2) * Int(x_n_stride))
+                    var x_offset_b = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2 + 1) * Int(x_n_stride))
                     x.ptr.offset(x_offset_a).store(Scalar[kernel_dtype](cum_a[n].cast[kernel_dtype]()))
                     x.ptr.offset(x_offset_b).store(Scalar[kernel_dtype](cum_b[n].cast[kernel_dtype]()))
                     cum_a[n] = 1.0
@@ -2122,8 +2138,8 @@ fn mamba_split_conv1d_scan_combined_cpu[
             
             if is_chunk_boundary or is_last_step:
                 for n in range(dstate):
-                    var x_offset_a = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2) * x_n_stride
-                    var x_offset_b = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2 + 1) * x_n_stride
+                    var x_offset_a = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2) * Int(x_n_stride))
+                    var x_offset_b = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2 + 1) * Int(x_n_stride))
                     x.ptr.offset(x_offset_a).store(Scalar[kernel_dtype](cum_a[n].cast[kernel_dtype]()))
                     x.ptr.offset(x_offset_b).store(Scalar[kernel_dtype](cum_b[n].cast[kernel_dtype]()))
                     cum_a[n] = 1.0
@@ -2435,8 +2451,8 @@ fn mamba_split_conv1d_scan_combined_gpu[
         
         if is_chunk_boundary or is_last_step:
             for n in range(dstate):
-                var x_offset_a = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2) * x_n_stride
-                var x_offset_b = UInt32(b) * x_b_stride + UInt32(d) * x_d_stride + UInt32(chunk_idx) * x_chunk_stride + UInt32(n * 2 + 1) * x_n_stride
+                var x_offset_a = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2) * Int(x_n_stride))
+                var x_offset_b = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2 + 1) * Int(x_n_stride))
                 x.ptr.offset(x_offset_a).store(Scalar[kernel_dtype](cum_a[n].cast[kernel_dtype]()))
                 x.ptr.offset(x_offset_b).store(Scalar[kernel_dtype](cum_b[n].cast[kernel_dtype]()))
                 cum_a[n] = 1.0

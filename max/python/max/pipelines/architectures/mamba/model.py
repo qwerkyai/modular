@@ -28,11 +28,9 @@ from max.graph import DeviceRef, Graph, Value
 from max.graph.weights import WeightData, Weights, WeightsAdapter
 from max.interfaces import LogProbabilities
 from max.nn import ReturnHiddenStates, ReturnLogits
-from max.nn.kv_cache import KVCacheInputs, KVCacheParams, PagedCacheValues
 from max.pipelines.core import TextContext
 from max.pipelines.lib import (
     KVCacheConfig,
-    KVCacheMixin,
     ModelInputs,
     ModelOutputs,
     PipelineConfig,
@@ -81,35 +79,54 @@ def _get_kernel_library_paths() -> list[Path]:
         return []
 
     paths: list[Path] = []
+    logger.debug(f"Searching for MambaKernelAPI.mojopkg in MODULAR_MOJO_MAX_IMPORT_PATH: {import_path_env}")
+    
     for entry in import_path_env.split(","):
-        if not entry:
+        if not entry.strip():
             continue
 
-        entry_path = Path(entry)
+        entry_path = Path(entry.strip())
+        
+        # Handle relative paths - try to resolve them relative to current working directory
+        if not entry_path.is_absolute():
+            # Try resolving relative to current directory first
+            resolved = Path.cwd() / entry_path
+            if not resolved.exists():
+                # If that doesn't work, try as-is (might be relative to runfiles root)
+                resolved = entry_path
+            entry_path = resolved
+        
         if not entry_path.exists():
-            logger.debug(f"Path does not exist: {entry_path}")
+            logger.debug(f"Path does not exist: {entry_path} (original: {entry.strip()})")
             continue
 
-        # Only load MambaKernelAPI - the package containing mamba-specific kernels
-        # MambaKernelAPI contains only causal_conv1d and selective_scan_fwd,
-        # avoiding conflicts with default kernels like rms_norm
-        if "MambaKernelAPI" not in entry_path.name:
-            logger.debug(f"Skipping non-MambaKernelAPI path: {entry_path}")
+        # If it's already a .mojopkg file, check if it's MambaKernelAPI
+        if entry_path.suffix == ".mojopkg":
+            if "MambaKernelAPI" in entry_path.name:
+                resolved_path = entry_path.resolve()
+                logger.info(f"Loading kernel library: {resolved_path}")
+                paths.append(resolved_path)
             continue
 
-        # If it's a directory, look for .mojopkg files inside
+        # If it's a directory, search recursively for MambaKernelAPI.mojopkg files
         if entry_path.is_dir():
-            for mojopkg in entry_path.glob("*.mojopkg"):
-                if mojopkg.is_file() or mojopkg.is_symlink():
-                    logger.info(f"Loading kernel library: {mojopkg}")
-                    paths.append(mojopkg)
-        # If it's already a .mojopkg file, use it directly
-        elif entry_path.suffix == ".mojopkg":
-            logger.info(f"Loading kernel library: {entry_path}")
-            paths.append(entry_path)
+            # Search recursively for MambaKernelAPI.mojopkg files
+            found = False
+            for mojopkg in entry_path.rglob("*.mojopkg"):
+                if "MambaKernelAPI" in mojopkg.name and (mojopkg.is_file() or mojopkg.is_symlink()):
+                    resolved_path = mojopkg.resolve()
+                    logger.info(f"Loading kernel library: {resolved_path}")
+                    paths.append(resolved_path)
+                    found = True
+                    # Continue searching in case there are multiple (shouldn't happen, but be safe)
+
+            if not found:
+                logger.debug(f"No MambaKernelAPI.mojopkg found in directory: {entry_path}")
 
     if not paths:
-        logger.warning(f"No MambaKernelAPI.mojopkg found in {import_path_env}")
+        logger.warning(f"No MambaKernelAPI.mojopkg found in MODULAR_MOJO_MAX_IMPORT_PATH: {import_path_env}")
+    else:
+        logger.info(f"Found {len(paths)} MambaKernelAPI.mojopkg file(s): {[str(p) for p in paths]}")
     return paths
 
 
@@ -141,7 +158,6 @@ class MambaInputs(ModelInputs):
         input_row_offsets: Tensor,
         signal_buffers: list[Tensor],
         return_n_logits: Tensor,
-        kv_cache_inputs: KVCacheInputs | None = None,
         lora_ids: Tensor | None = None,
         lora_ranks: Tensor | None = None,
         lora_grouped_offsets: Tensor | None = None,
@@ -162,7 +178,6 @@ class MambaInputs(ModelInputs):
         self.tokens = tokens
         self.input_row_offsets = input_row_offsets
         self.signal_buffers = signal_buffers
-        self.kv_cache_inputs = kv_cache_inputs
         self.return_n_logits = return_n_logits
         self.lora_ids = lora_ids
         self.lora_ranks = lora_ranks
@@ -175,7 +190,7 @@ class MambaInputs(ModelInputs):
         self.data_parallel_splits = data_parallel_splits
 
 
-class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
+class MambaModelBase(PipelineModel[TextContext]):
     """Base Mamba pipeline model implementation."""
 
     model: Model
@@ -221,29 +236,12 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
         self.logprobs_device = devices[0]
         self.logprobs_model = self.load_logprobs_model(session)
 
-    @classmethod
-    def get_kv_params(
-        cls,
-        huggingface_config: AutoConfig,
-        pipeline_config: PipelineConfig,
-        devices: list[DeviceRef],
-        kv_cache_config: KVCacheConfig,
-        cache_dtype: DType,
-    ) -> KVCacheParams:
-        return MambaConfig.get_kv_params(
-            huggingface_config,
-            pipeline_config,
-            devices,
-            kv_cache_config,
-            cache_dtype,
-        )
 
     @classmethod
     def get_num_layers(cls, huggingface_config: AutoConfig) -> int:
         return MambaConfig.get_num_layers(huggingface_config)
 
     def execute(self, model_inputs: ModelInputs) -> ModelOutputs:
-        curr_kv_cache_inputs = model_inputs.kv_cache_inputs or ()
         assert isinstance(model_inputs, MambaInputs)
 
         if self.pipeline_config.model_config.data_parallel_degree > 1:
@@ -267,7 +265,6 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
                 model_inputs.input_row_offsets,
                 model_inputs.return_n_logits,
                 splits_tensor,
-                *curr_kv_cache_inputs,
             )
         elif self._lora_manager:
             model_outputs = self.model.execute(
@@ -283,7 +280,6 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
                 model_inputs.lora_ids_kv,  # type: ignore
                 model_inputs.lora_grouped_offsets_kv,  # type: ignore
                 *model_inputs.signal_buffers,
-                *curr_kv_cache_inputs,
             )
         else:
             model_outputs = self.model.execute(
@@ -291,7 +287,6 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
                 model_inputs.input_row_offsets,
                 model_inputs.return_n_logits,
                 *model_inputs.signal_buffers,
-                *curr_kv_cache_inputs,
             )
 
         has_offsets = self.return_logits in (
@@ -339,7 +334,6 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
     def prepare_initial_token_inputs(
         self,
         replica_batches: Sequence[Sequence[TextContext]],
-        kv_cache_inputs: KVCacheInputs | None = None,
         return_n_logits: int = 1,
     ) -> MambaInputs:
         """Prepare the inputs for the first pass in multistep execution."""
@@ -377,7 +371,6 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
                 self.devices[0]
             ),
             signal_buffers=self.signal_buffers,
-            kv_cache_inputs=kv_cache_inputs,
             return_n_logits=Tensor.from_numpy(
                 np.array([return_n_logits], dtype=np.int64)
             ),
@@ -426,7 +419,6 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
             tokens=next_tokens,
             input_row_offsets=next_row_offsets,
             signal_buffers=self.signal_buffers,
-            kv_cache_inputs=prev_model_inputs.kv_cache_inputs,
             return_n_logits=prev_model_inputs.return_n_logits,
             lora_ids=prev_model_inputs.lora_ids,
             lora_ranks=prev_model_inputs.lora_ranks,
@@ -486,31 +478,6 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
         )
         return session.load(graph)
 
-    def _unflatten_kv_inputs(
-        self, kv_inputs_flat: Sequence[Value[Any]]
-    ) -> list[PagedCacheValues]:
-        kv_params = MambaConfig.get_kv_params(
-            huggingface_config=self.huggingface_config,
-            pipeline_config=self.pipeline_config,
-            devices=[DeviceRef.from_device(d) for d in self.devices],
-            kv_cache_config=self.kv_cache_config,
-            cache_dtype=self.encoding.cache_dtype,
-        )
-        n_devices = kv_params.n_devices
-        fetch_types = kv_params.get_symbolic_inputs()[0]
-        len_of_kv_tuple_per_dev = len(list(fetch_types))
-        kv_caches_per_dev: list[PagedCacheValues] = []
-        for i in range(n_devices):
-            start_idx = i * len_of_kv_tuple_per_dev
-            kv_caches_per_dev.append(
-                PagedCacheValues(
-                    kv_blocks=kv_inputs_flat[start_idx].buffer,
-                    cache_lengths=kv_inputs_flat[start_idx + 1].tensor,
-                    lookup_table=kv_inputs_flat[start_idx + 2].tensor,
-                    max_lengths=kv_inputs_flat[start_idx + 3].tensor,
-                )
-            )
-        return kv_caches_per_dev
 
     def _get_state_dict(
         self,
@@ -552,7 +519,7 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
 
         if model_config.data_parallel_degree > 1:
             graph, new_state_dict = create_data_parallel_graph(
-                model_config, self.kv_params, state_dict
+                model_config, state_dict
             )
             self.state_dict = new_state_dict
             return graph
@@ -573,7 +540,7 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
 
             with Graph(
                 getattr(self.huggingface_config, "model_type", "mamba"),
-                input_types=dist_model.input_types(self.kv_params),
+                input_types=dist_model.input_types(),
                 custom_extensions=_get_kernel_library_paths(),
             ) as graph:
                 tokens, input_row_offsets, return_n_logits, *variadic_args = (
@@ -585,15 +552,9 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
                     v.buffer for v in variadic_args[: len(self.devices)]
                 ]
 
-                # Unmarshal the remaining arguments, which are for KV cache.
-                kv_caches_per_dev = self._unflatten_kv_inputs(
-                    variadic_args[len(self.devices) :]
-                )
-
                 outputs = dist_model(
                     tokens.tensor,
                     signal_buffers,
-                    kv_caches_per_dev,
                     return_n_logits.tensor,
                     input_row_offsets.tensor,
                 )
@@ -619,9 +580,7 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
 
             with Graph(
                 "mamba",
-                input_types=single_model.input_types(
-                    self.kv_params, self._lora_manager
-                ),
+                input_types=single_model.input_types(self._lora_manager),
                 custom_extensions=_get_kernel_library_paths(),
             ) as graph:
                 if self._lora_manager:
@@ -637,7 +596,6 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
                         batch_seq_len,
                         lora_ids_kv,
                         lora_grouped_offsets_kv,
-                        *kv_cache_inputs,
                     ) = graph.inputs
                     self._lora_manager.set_graph_info(
                         lora_ids.tensor,
@@ -654,17 +612,9 @@ class MambaModelBase(PipelineModel[TextContext], KVCacheMixin):
                         tokens,
                         input_row_offsets,
                         return_n_logits,
-                        *kv_cache_inputs,
                     ) = graph.inputs
-                kv_collection = PagedCacheValues(
-                    kv_blocks=kv_cache_inputs[0].buffer,
-                    cache_lengths=kv_cache_inputs[1].tensor,
-                    lookup_table=kv_cache_inputs[2].tensor,
-                    max_lengths=kv_cache_inputs[3].tensor,
-                )
                 outputs = single_model(
                     tokens.tensor,
-                    kv_collection,
                     return_n_logits.tensor,
                     input_row_offsets.tensor,
                 )

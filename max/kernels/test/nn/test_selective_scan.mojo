@@ -364,4 +364,373 @@ def main():
         batch=2, dim=8, seqlen=32, dstate=8, n_groups=1
     )
     print("✓ Selective scan longer sequence test passed")
+    
+    # Test selective scan update
+    run_selective_scan_update[DType.float32, has_D=True, has_z=True, has_delta_bias=True, delta_softplus=False](
+        batch=2, dim=4, dstate=4, n_groups=1
+    )
+    print("✓ Basic selective scan update test passed")
+    
+    # Test update without D
+    run_selective_scan_update[DType.float32, has_D=False, has_z=True, has_delta_bias=True, delta_softplus=False](
+        batch=2, dim=4, dstate=4, n_groups=1
+    )
+    print("✓ Selective scan update without D test passed")
+    
+    # Test update without z
+    run_selective_scan_update[DType.float32, has_D=True, has_z=False, has_delta_bias=True, delta_softplus=False](
+        batch=2, dim=4, dstate=4, n_groups=1
+    )
+    print("✓ Selective scan update without z test passed")
+    
+    # Test update with delta_softplus
+    run_selective_scan_update[DType.float32, has_D=True, has_z=True, has_delta_bias=True, delta_softplus=True](
+        batch=2, dim=4, dstate=4, n_groups=1
+    )
+    print("✓ Selective scan update with delta_softplus test passed")
+    
+    # Test update with larger dimensions
+    run_selective_scan_update[DType.float32, has_D=True, has_z=True, has_delta_bias=True, delta_softplus=False](
+        batch=4, dim=8, dstate=8, n_groups=1
+    )
+    print("✓ Selective scan update larger dimensions test passed")
+
+
+fn run_selective_scan_update[
+    dtype: DType,
+    has_D: Bool = True,
+    has_z: Bool = True,
+    has_delta_bias: Bool = True,
+    delta_softplus: Bool = False,
+](
+    batch: Int,
+    dim: Int,
+    dstate: Int,
+    n_groups: Int,
+    rtol: Float64 = 0.01,
+) raises:
+    """Test selective scan update kernel against reference implementation."""
+    if dstate > MAX_DSTATE:
+        return  # Skip if dstate exceeds kernel limit
+    
+    var group_size = dim // n_groups
+    
+    # Allocate host memory
+    comptime layout_3d = Layout.row_major[3]()
+    comptime layout_2d = Layout.row_major[2]()
+    comptime layout_1d = Layout(UNKNOWN_VALUE)
+    
+    # state_in: (batch, dim, dstate)
+    var state_in_heap = alloc[Scalar[dtype]](batch * dim * dstate)
+    var state_in_h = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
+        state_in_heap, RuntimeLayout[layout_3d].row_major(Index(batch, dim, dstate))
+    )
+    
+    # state_out: (batch, dim, dstate)
+    var state_out_heap = alloc[Scalar[dtype]](batch * dim * dstate)
+    var state_out_h = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
+        state_out_heap, RuntimeLayout[layout_3d].row_major(Index(batch, dim, dstate))
+    ).fill(0)
+    
+    # output: (batch, dim)
+    var output_heap = alloc[Scalar[dtype]](batch * dim)
+    var output_h = LayoutTensor[dtype, layout_2d, MutAnyOrigin](
+        output_heap, RuntimeLayout[layout_2d].row_major(Index(batch, dim))
+    ).fill(0)
+    
+    # x: (batch, dim)
+    var x_heap = alloc[Scalar[dtype]](batch * dim)
+    var x_h = LayoutTensor[dtype, layout_2d, MutAnyOrigin](
+        x_heap, RuntimeLayout[layout_2d].row_major(Index(batch, dim))
+    )
+    
+    # dt: (batch, dim)
+    var dt_heap = alloc[Scalar[dtype]](batch * dim)
+    var dt_h = LayoutTensor[dtype, layout_2d, MutAnyOrigin](
+        dt_heap, RuntimeLayout[layout_2d].row_major(Index(batch, dim))
+    )
+    
+    # A: (dim, dstate)
+    var A_heap = alloc[Scalar[dtype]](dim * dstate)
+    var A_h = LayoutTensor[dtype, layout_2d, MutAnyOrigin](
+        A_heap, RuntimeLayout[layout_2d].row_major(Index(dim, dstate))
+    )
+    
+    # B: (batch, n_groups, dstate)
+    var B_heap = alloc[Scalar[dtype]](batch * n_groups * dstate)
+    var B_h = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
+        B_heap, RuntimeLayout[layout_3d].row_major(Index(batch, n_groups, dstate))
+    )
+    
+    # C: (batch, n_groups, dstate)
+    var C_heap = alloc[Scalar[dtype]](batch * n_groups * dstate)
+    var C_h = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
+        C_heap, RuntimeLayout[layout_3d].row_major(Index(batch, n_groups, dstate))
+    )
+    
+    # D: (dim,) or empty
+    var D_size = dim if has_D else 0
+    var D_heap = alloc[Scalar[dtype]](max(D_size, 1))
+    var D_h = LayoutTensor[dtype, layout_1d, MutAnyOrigin](
+        D_heap, RuntimeLayout[layout_1d].row_major(Index(D_size))
+    )
+    
+    # z: (batch, dim) or empty
+    var z_size = batch * dim if has_z else 0
+    var z_heap = alloc[Scalar[dtype]](max(z_size, 1))
+    var z_h = LayoutTensor[dtype, layout_2d, MutAnyOrigin](
+        z_heap, RuntimeLayout[layout_2d].row_major(Index(batch if has_z else 0, dim if has_z else 0))
+    )
+    
+    # dt_bias: (dim,) or empty
+    var dt_bias_size = dim if has_delta_bias else 0
+    var dt_bias_heap = alloc[Scalar[dtype]](max(dt_bias_size, 1))
+    var dt_bias_h = LayoutTensor[dtype, layout_1d, MutAnyOrigin](
+        dt_bias_heap, RuntimeLayout[layout_1d].row_major(Index(dt_bias_size))
+    )
+    
+    # Reference output
+    var state_out_ref_heap = alloc[Scalar[dtype]](batch * dim * dstate)
+    var state_out_ref_h = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
+        state_out_ref_heap, RuntimeLayout[layout_3d].row_major(Index(batch, dim, dstate))
+    ).fill(0)
+    
+    var output_ref_heap = alloc[Scalar[dtype]](batch * dim)
+    var output_ref_h = LayoutTensor[dtype, layout_2d, MutAnyOrigin](
+        output_ref_heap, RuntimeLayout[layout_2d].row_major(Index(batch, dim))
+    ).fill(0)
+    
+    # Initialize input data
+    random(state_in_h)
+    random(x_h)
+    random(dt_h)
+    random(A_h)
+    random(B_h)
+    random(C_h)
+    if has_D:
+        random(D_h)
+    if has_z:
+        random(z_h)
+    if has_delta_bias:
+        random(dt_bias_h)
+    
+    # Scale A to be negative for stability
+    for i in range(dim * dstate):
+        var val = A_h.ptr[i]
+        A_h.ptr[i] = Scalar[dtype](Float32(val) * -0.5)
+    
+    # Copy state_in for reference
+    for i in range(batch * dim * dstate):
+        state_out_ref_h.ptr[i] = state_in_h.ptr[i]
+    
+    var state_in_buf = state_in_h
+    var state_out_buf = state_out_h
+    var output_buf = output_h
+    var x_buf = x_h
+    var dt_buf = dt_h
+    var A_buf = A_h
+    var B_buf = B_h
+    var C_buf = C_h
+    var D_buf = D_h
+    var z_buf = z_h
+    var dt_bias_buf = dt_bias_h
+    
+    # Strides for row-major layout
+    var state_out_b_stride: UInt32 = dim * dstate
+    var state_out_d_stride: UInt32 = dstate
+    var state_out_n_stride: UInt32 = 1
+    
+    var output_b_stride: UInt32 = dim
+    var output_d_stride: UInt32 = 1
+    
+    var state_in_b_stride: UInt32 = dim * dstate
+    var state_in_d_stride: UInt32 = dstate
+    var state_in_n_stride: UInt32 = 1
+    
+    var x_b_stride: UInt32 = dim
+    var x_d_stride: UInt32 = 1
+    
+    var dt_b_stride: UInt32 = dim
+    var dt_d_stride: UInt32 = 1
+    
+    var A_d_stride: UInt32 = dstate
+    var A_n_stride: UInt32 = 1
+    
+    var B_b_stride: UInt32 = n_groups * dstate
+    var B_g_stride: UInt32 = dstate
+    var B_n_stride: UInt32 = 1
+    
+    var C_b_stride: UInt32 = n_groups * dstate
+    var C_g_stride: UInt32 = dstate
+    var C_n_stride: UInt32 = 1
+    
+    var D_stride: UInt32 = 1
+    
+    var z_b_stride: UInt32 = dim
+    var z_d_stride: UInt32 = 1
+    
+    var dt_bias_stride: UInt32 = 1
+    
+    # Run kernel
+    selective_scan_update_cpu[
+        dtype,
+        state_out_buf.layout,
+        output_buf.layout,
+        state_in_buf.layout,
+        x_buf.layout,
+        dt_buf.layout,
+        A_buf.layout,
+        B_buf.layout,
+        C_buf.layout,
+        D_buf.layout,
+        z_buf.layout,
+        dt_bias_buf.layout,
+    ](
+        batch,
+        dim,
+        dstate,
+        group_size,
+        Int8(1) if delta_softplus else Int8(0),
+        state_out_buf,
+        output_buf,
+        state_in_buf,
+        x_buf,
+        dt_buf,
+        A_buf,
+        B_buf,
+        C_buf,
+        D_buf,
+        z_buf,
+        dt_bias_buf,
+        state_out_b_stride,
+        state_out_d_stride,
+        state_out_n_stride,
+        output_b_stride,
+        output_d_stride,
+        state_in_b_stride,
+        state_in_d_stride,
+        state_in_n_stride,
+        x_b_stride,
+        x_d_stride,
+        dt_b_stride,
+        dt_d_stride,
+        A_d_stride,
+        A_n_stride,
+        B_b_stride,
+        B_g_stride,
+        B_n_stride,
+        C_b_stride,
+        C_g_stride,
+        C_n_stride,
+        D_stride,
+        z_b_stride,
+        z_d_stride,
+        dt_bias_stride,
+    )
+    
+    # Reference implementation
+    for b in range(batch):
+        for d in range(dim):
+            var group_id = d // group_size
+            
+            # Load dt value
+            var dt_offset = b * dim + d
+            var dt_val = Float32(dt_buf.ptr[dt_offset])
+            
+            # Apply dt_bias if present
+            if has_delta_bias:
+                var bias_val = Float32(dt_bias_buf.ptr[d])
+                dt_val += bias_val
+            
+            # Apply softplus if requested
+            if delta_softplus:
+                dt_val = softplus_ref(dt_val)
+            
+            # Load x value
+            var x_offset = b * dim + d
+            var x_val = Float32(x_buf.ptr[x_offset])
+            
+            # Load A values and compute dA
+            var dA_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+            for n in range(dstate):
+                var A_offset = d * dstate + n
+                var A_val = Float32(A_buf.ptr[A_offset]) * LOG2E
+                dA_vals[n] = exp2(A_val * dt_val)
+            
+            # Load B values and compute dB
+            var dB_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+            for n in range(dstate):
+                var B_offset = b * n_groups * dstate + group_id * dstate + n
+                var B_val = Float32(B_buf.ptr[B_offset])
+                dB_vals[n] = B_val * dt_val
+            
+            # Load current state
+            var state_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+            for n in range(dstate):
+                var state_offset = b * dim * dstate + d * dstate + n
+                state_vals[n] = Float32(state_out_ref_h.ptr[state_offset])
+            
+            # Update state
+            state_vals = state_vals * dA_vals + dB_vals * x_val
+            
+            # Store updated state
+            for n in range(dstate):
+                var state_offset = b * dim * dstate + d * dstate + n
+                state_out_ref_h.ptr[state_offset] = Scalar[dtype](state_vals[n])
+            
+            # Load C values
+            var C_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+            for n in range(dstate):
+                var C_offset = b * n_groups * dstate + group_id * dstate + n
+                C_vals[n] = Float32(C_buf.ptr[C_offset])
+            
+            # Compute output
+            var out_val = (state_vals * C_vals).reduce_add()
+            
+            # Add skip connection
+            if has_D:
+                var D_val = Float32(D_buf.ptr[d])
+                out_val += x_val * D_val
+            
+            # Apply gating
+            if has_z:
+                var z_offset = b * dim + d
+                var z_val = Float32(z_buf.ptr[z_offset])
+                out_val *= z_val * sigmoid_ref(z_val)
+            
+            # Store output
+            var out_offset = b * dim + d
+            output_ref_h.ptr[out_offset] = Scalar[dtype](out_val)
+    
+    # Compare results
+    var state_size = batch * dim * dstate
+    for i in range(state_size):
+        assert_almost_equal(
+            state_out_h.ptr[i],
+            state_out_ref_h.ptr[i],
+            rtol=rtol,
+        )
+    
+    var output_size = batch * dim
+    for i in range(output_size):
+        assert_almost_equal(
+            output_h.ptr[i],
+            output_ref_h.ptr[i],
+            rtol=rtol,
+        )
+    
+    # Cleanup
+    state_in_heap.free()
+    state_out_heap.free()
+    output_heap.free()
+    x_heap.free()
+    dt_heap.free()
+    A_heap.free()
+    B_heap.free()
+    C_heap.free()
+    D_heap.free()
+    z_heap.free()
+    dt_bias_heap.free()
+    state_out_ref_heap.free()
+    output_ref_heap.free()
 

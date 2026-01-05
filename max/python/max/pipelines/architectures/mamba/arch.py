@@ -13,7 +13,6 @@
 
 from max.graph.weights import WeightsFormat
 from max.interfaces import PipelineTask
-from max.nn.kv_cache import KVCacheStrategy
 from max.pipelines.core import TextContext
 from max.pipelines.lib import (
     RopeType,
@@ -32,8 +31,8 @@ mamba_arch = SupportedArchitecture(
     ],
     default_encoding=SupportedEncoding.bfloat16,
     supported_encodings={
-        SupportedEncoding.bfloat16: [KVCacheStrategy.PAGED],
-        SupportedEncoding.float32: [KVCacheStrategy.PAGED],
+        SupportedEncoding.bfloat16: [],
+        SupportedEncoding.float32: [],
     },
     pipeline_model=MambaModel,
     tokenizer=TextTokenizer,

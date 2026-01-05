@@ -34,6 +34,7 @@ from .float8_config import (
 from .identity import Identity
 from .layer import Layer, LayerList, Module, Shardable
 from .linear import (
+    GatedMLP,
     MLP,
     MLPV1,
     ColumnParallelLinear,
@@ -50,6 +51,9 @@ from .norm import (
     LayerNormV1,
     RMSNorm,
     RMSNormV1,
+    FusedRMSNorm,
+    layer_norm_fn,
+    rms_norm_fn,
 )
 from .rotary_embedding import (
     DynamicRotaryEmbedding,
@@ -73,6 +77,7 @@ from .transformer import (
 )
 
 __all__ = [
+    "GatedMLP",
     "MLP",
     "MLPV1",
     "Allreduce",
@@ -118,6 +123,9 @@ __all__ = [
     "Module",
     "RMSNorm",
     "RMSNormV1",
+    "FusedRMSNorm",
+    "layer_norm_fn",
+    "rms_norm_fn",
     "RaggedAttention",
     "ReturnHiddenStates",
     "ReturnLogits",

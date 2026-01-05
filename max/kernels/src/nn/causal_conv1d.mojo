@@ -106,6 +106,8 @@ fn causal_conv1d_channel_first_fwd_cpu[
     out_c_stride: UInt32,
     out_l_stride: UInt32,
 
+    bias_stride: UInt32,
+
     silu_activation: Bool,
 ):
     """CPU implementation of causal conv1d for channel-first layout with bias.
@@ -131,6 +133,7 @@ fn causal_conv1d_channel_first_fwd_cpu[
         out_batch_stride: Stride for the batch dimension of the output tensor.
         out_c_stride: Stride for the channel dimension of the output tensor.
         out_l_stride: Stride for the sequence length dimension of the output tensor.
+        bias_stride: Stride for the bias tensor.
         silu_activation: Whether to apply SiLU activation.
     """
     var width_minus_1: Int = width - 1
@@ -142,8 +145,17 @@ fn causal_conv1d_channel_first_fwd_cpu[
         var b = bc_idx // dim
         var c = bc_idx % dim
         
-        var weight_c_base_offset = UInt32(c * weight_c_stride)
-        var cur_bias = Scalar[output_dtype](bias.ptr.offset(c).load())
+        # Bounds checking
+        if b >= batch or c >= dim:
+            return
+        
+        # Validate bias tensor has valid dimensions (use debug_assert since we can't raise in @parameter fn)
+        debug_assert(bias.dim(0) > 0, "Bias tensor must have at least one element")
+        debug_assert(c < bias.dim(0), "Channel index out of bounds for bias tensor")
+        
+        var weight_c_base_offset = UInt32(c * Int(weight_c_stride))
+        var bias_offset = UInt32(c * Int(bias_stride))
+        var cur_bias: Scalar[output_dtype] = Scalar[output_dtype](bias.ptr.offset(bias_offset).load())
         
         # Pre-load weights for this channel to reduce memory access
         var w0: Scalar[weight_dtype] = 0
@@ -153,14 +165,14 @@ fn causal_conv1d_channel_first_fwd_cpu[
         if width >= 1:
             w0 = Scalar[weight_dtype](weight.ptr.offset(weight_c_base_offset).load())
         if width >= 2:
-            w1 = Scalar[weight_dtype](weight.ptr.offset(weight_c_base_offset + UInt32(weight_width_stride)).load())
+            w1 = Scalar[weight_dtype](weight.ptr.offset(weight_c_base_offset + UInt32(Int(weight_width_stride))).load())
         if width >= 3:
-            w2 = Scalar[weight_dtype](weight.ptr.offset(weight_c_base_offset + UInt32(2 * weight_width_stride)).load())
+            w2 = Scalar[weight_dtype](weight.ptr.offset(weight_c_base_offset + UInt32(2 * Int(weight_width_stride))).load())
         if width >= 4:
-            w3 = Scalar[weight_dtype](weight.ptr.offset(weight_c_base_offset + UInt32(3 * weight_width_stride)).load())
+            w3 = Scalar[weight_dtype](weight.ptr.offset(weight_c_base_offset + UInt32(3 * Int(weight_width_stride))).load())
         
-        var x_base = UInt32(b * x_batch_stride + c * x_c_stride)
-        var out_base = UInt32(b * out_batch_stride + c * out_c_stride)
+        var x_base = UInt32(b * Int(x_batch_stride) + c * Int(x_c_stride))
+        var out_base = UInt32(b * Int(out_batch_stride) + c * Int(out_c_stride))
         
         # Process all sequence positions
         for l in range(seqlen):
@@ -603,6 +615,7 @@ fn causal_conv1d_channel_first_fwd_gpu[
     out_c_stride: UInt32,
     out_l_stride: UInt32,
 
+    bias_stride: UInt32,
     silu_activation: Int8,
 ):
     """Optimized GPU implementation of causal conv1d for channel-first layout with bias.
@@ -634,6 +647,7 @@ fn causal_conv1d_channel_first_fwd_gpu[
         out_batch_stride: Stride for the batch dimension of the output tensor.
         out_c_stride: Stride for the channel dimension of the output tensor.
         out_l_stride: Stride for the sequence length dimension of the output tensor.
+        bias_stride: Stride for the channel dimension of the bias tensor.
         silu_activation: Whether to apply SiLU activation (Int8: 0 or 1).
     """
     
@@ -650,9 +664,19 @@ fn causal_conv1d_channel_first_fwd_gpu[
     if batch_id >= nBatches or channel_id >= nChannels or kWidth != width:
         return
 
+    # Safety check for null pointers
+    if Int(x.ptr) == 0 or Int(output.ptr) == 0 or Int(weight.ptr) == 0 or Int(bias.ptr) == 0:
+        return
+
+    # Safety check for bias dimension - if bias is empty or channel_id is out of bounds, use zero bias
+    var bias_dim = bias.dim(0)
+    var cur_bias: Scalar[x_dtype] = 0
+    if bias_dim > 0 and channel_id < bias_dim:
+        var bias_offset = UInt32(channel_id) * bias_stride
+        cur_bias = Scalar[x_dtype](bias.ptr.offset(bias_offset).load())
+
     var x_vals: SIMD[x_dtype, kNElts * 2]
     var out_vals: SIMD[output_dtype, kNElts] = 0
-    var cur_bias: Scalar[x_dtype]
     var prev_input_chunk: SIMD[x_dtype, kNElts]
     var input_chunk: SIMD[x_dtype, kNElts]
     
@@ -682,8 +706,6 @@ fn causal_conv1d_channel_first_fwd_gpu[
         w0 = Scalar[x_dtype](weight.ptr.offset(weight_c_base + UInt32(0) * weight_width_stride).load())
         w1 = Scalar[x_dtype](weight.ptr.offset(weight_c_base + UInt32(1) * weight_width_stride).load())
         w2 = Scalar[x_dtype](weight.ptr.offset(weight_c_base + UInt32(2) * weight_width_stride).load())
-    
-    cur_bias = Scalar[x_dtype](bias.ptr.offset(channel_id).load())
 
     var seq_start: Int = chunk_id * kChunkSize * kNElts + tidx * kNElts
     var seq_end: Int = min(seq_start + kNElts, nSeqLen)
@@ -1043,9 +1065,22 @@ fn causal_conv1d_channel_last_fwd_gpu[
     if channel_start >= nChannels:
         return
 
+    # Safety check for null pointers
+    if Int(x.ptr) == 0 or Int(output.ptr) == 0 or Int(weight.ptr) == 0 or Int(bias.ptr) == 0:
+        return
+    
+    # Safety check for bias tensor dimensions
+    var bias_dim = bias.dim(0)
+    if bias_dim == 0:
+        return
+
     for c_offset in range(kNElts):
         var c_idx: Int = channel_start + c_offset
         if c_idx >= nChannels:
+            break
+        
+        # Safety check for bias dimension
+        if c_idx >= bias_dim:
             break
         
         var cur_bias: Scalar[output_dtype] = Scalar[output_dtype](bias.ptr.offset(c_idx).load())
@@ -1366,6 +1401,15 @@ fn causal_conv1d_channel_last_fwd_gpu_with_seq_idx[
     if channel_start >= nChannels:
         return
 
+    # Safety check for null pointers
+    if Int(x.ptr) == 0 or Int(output.ptr) == 0 or Int(weight.ptr) == 0 or Int(bias.ptr) == 0:
+        return
+    
+    # Safety check for bias tensor dimensions
+    var bias_dim = bias.dim(0)
+    if bias_dim == 0:
+        return
+
     # Helper function to load SIMD vector from 3D tensor at (batch, seq, channel_start)
     # For channel-last (B, L, C), offset = batch * x_batch_stride + seq * x_l_stride + channel_start * x_c_stride
     for c_offset in range(kNElts):
@@ -1373,7 +1417,13 @@ fn causal_conv1d_channel_last_fwd_gpu_with_seq_idx[
         if c_idx >= nChannels:
             break
         
-        var cur_bias: Scalar[output_dtype] = Scalar[output_dtype](bias.ptr.offset(c_idx).load())
+        # Safety check for bias dimension
+        if c_idx >= bias_dim:
+            break
+        
+        # Access bias with proper offset (assuming stride=1 for bias tensor)
+        var bias_offset = UInt32(c_idx)
+        var cur_bias: Scalar[output_dtype] = Scalar[output_dtype](bias.ptr.offset(bias_offset).load())
         
         # Load weights directly from memory to avoid vectorize issues
         # For kWidth == 3, use scalar operations to avoid SIMD issues
@@ -1822,11 +1872,24 @@ fn causal_conv1d_channel_first_fwd_gpu_with_seq_idx[
     if channel_start >= nChannels:
         return
 
+    # Safety check for null pointers
+    if Int(x.ptr) == 0 or Int(output.ptr) == 0 or Int(weight.ptr) == 0 or Int(bias.ptr) == 0:
+        return
+    
+    # Safety check for bias tensor dimensions
+    var bias_dim = bias.dim(0)
+    if bias_dim == 0:
+        return
+
     # For channel-first (B, C, L), we process each channel separately
     # Since sequence dimension is contiguous (stride=1), we can load directly from memory
     for c_offset in range(kNElts):
         var c_idx: Int = channel_start + c_offset
         if c_idx >= nChannels:
+            break
+        
+        # Safety check for bias dimension
+        if c_idx >= bias_dim:
             break
         
         var cur_bias: Scalar[output_dtype] = Scalar[output_dtype](bias.ptr.offset(c_idx).load())

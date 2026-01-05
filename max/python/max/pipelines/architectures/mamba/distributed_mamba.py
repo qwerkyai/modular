@@ -30,7 +30,6 @@ from max.nn import (
     Signals,
     VocabParallelEmbedding,
 )
-from max.nn.kv_cache import KVCacheParams
 
 logger = logging.getLogger("max.pipelines")
 from .model_config import MambaConfig
@@ -119,7 +118,6 @@ class DistributedMamba(DistributedTransformer):
             norm=create_distributed_norm(),
             output=output,
             embedding=embedding_layer,
-            kv_params=config.kv_params,
             devices=config.devices,
             rope=None,  # Mamba doesn't use RoPE
             return_logits=config.return_logits,
@@ -129,7 +127,7 @@ class DistributedMamba(DistributedTransformer):
         )
 
     def input_types(
-        self, kv_params: KVCacheParams
+        self,
     ) -> tuple[TensorType | BufferType, ...]:
         # TODO: Move input symbol computation from the manager classes.
         device_ref = self.config.devices[0]
@@ -139,8 +137,6 @@ class DistributedMamba(DistributedTransformer):
             DType.int64, shape=["return_n_logits"], device=DeviceRef.CPU()
         )
 
-        kv_inputs = kv_params.get_symbolic_inputs()
-
         # Construct Graph Inputs
         tokens_type = TensorType(
             DType.int64, shape=["total_seq_len"], device=device_ref
@@ -148,10 +144,6 @@ class DistributedMamba(DistributedTransformer):
         input_row_offsets_type = TensorType(
             DType.uint32, shape=["input_row_offsets_len"], device=device_ref
         )
-        # Flatten kv types for each device
-        flattened_kv_types: list[TensorType] = [
-            kv_type for sublist in kv_inputs for kv_type in sublist
-        ]
 
         signals = Signals(devices=self.config.devices)
 
@@ -165,7 +157,31 @@ class DistributedMamba(DistributedTransformer):
             return_n_logits_type,
         ]
         all_input_types.extend(signal_buffer_types)
-        all_input_types.extend(flattened_kv_types)
 
         return tuple(all_input_types)
+
+    def __call__(
+        self,
+        tokens: TensorValue,
+        signal_buffers: list[BufferValue],
+        return_n_logits: TensorValue,
+        input_row_offsets: TensorValue,
+    ) -> tuple[TensorValue, ...]:
+        """Forward pass for distributed Mamba model without KV cache.
+        
+        Args:
+            tokens: Input token IDs.
+            signal_buffers: Signal buffers for multi-GPU communication.
+            return_n_logits: Number of logits to return.
+            input_row_offsets: Row offsets for ragged tensor processing.
+            
+        Returns:
+            Tuple of output tensors (logits, and optionally offsets and hidden states).
+        """
+        # TODO: Implement proper distributed Mamba forward pass
+        # For now, this is a placeholder that doesn't use KV cache
+        raise NotImplementedError(
+            "DistributedMamba.__call__ is not yet implemented. "
+            "Mamba models do not use KV cache."
+        )
 

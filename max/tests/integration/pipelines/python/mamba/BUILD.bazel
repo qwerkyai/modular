@@ -27,13 +27,19 @@ modular_py_test(
     ],
     env = {
         "MODULAR_PATH": ".",
+        "MODULAR_DEVICE_CONTEXT_SYNC_MODE": "true",
+    },
+    exec_properties = {
+        # Request 8 GiB of GPU memory (after subtracting 0.6 GiB overhead,
+        # this gives ~7.4 GiB available to the memory manager)
+        "test.resources:gpu-memory": "8",
     },
     imports = [
         "../",  # For hf_repo_lock
     ],
     mojo_deps = select({
-        "//:emit_mojo_enabled": PROD_MOJOPKGS + MAMBA_MOJOPKGS,
-        "//conditions:default": [],
+        "//:emit_mojo_enabled": MAMBA_MOJOPKGS,
+        "//conditions:default": MAMBA_MOJOPKGS,
     }),
     tags = [
         "no-sandbox",
