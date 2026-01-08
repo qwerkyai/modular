@@ -923,7 +923,6 @@ def main():
             run_selective_scan_gpu[DType.float32, has_D=True, has_z=True, has_delta_bias=True, delta_softplus=False](
                 batch=1, dim=4, seqlen=seqlen, dstate=4, n_groups=1, ctx=ctx
             )
-            print("✓ Selective scan GPU seqlen=" + String(seqlen) + " test passed")
         
         # Test with mamba-130m-hf realistic dimensions
         # dim=1536, dstate=16, n_groups=1
@@ -931,13 +930,11 @@ def main():
             run_selective_scan_gpu[DType.float32, has_D=True, has_z=True, has_delta_bias=True, delta_softplus=True](
                 batch=1, dim=1536, seqlen=seqlen, dstate=16, n_groups=1, ctx=ctx
             )
-            print("✓ Selective scan GPU mamba-130m dim=1536 seqlen=" + String(seqlen) + " test passed")
         
         # Strict tolerance test - check if CPU/GPU have tiny differences that could compound
         run_selective_scan_gpu[DType.float32, has_D=True, has_z=True, has_delta_bias=True, delta_softplus=True](
             batch=1, dim=1536, seqlen=7, dstate=16, n_groups=1, ctx=ctx, rtol=0.0001  # 0.01% tolerance
         )
-        print("✓ Strict tolerance (0.01%) seqlen=7 test passed")
         
         # Test selective scan update
         run_selective_scan_update_gpu[DType.float32, has_D=True, has_z=True, has_delta_bias=True, delta_softplus=False](
