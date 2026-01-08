@@ -127,33 +127,6 @@ def selective_scan_fn(
         shape=[batch_dim, dim_dim, seqlen] if has_z else [0, 0, 0],
         device=device,
     )
-    
-    # Debug logging - print tensor information before kernel call
-    import os
-    if os.environ.get("DEBUG_SELECTIVE_SCAN"):
-        print(f"\n=== selective_scan_fn DEBUG ===")
-        print(f"Input shapes:")
-        print(f"  u.shape = {u.shape}")
-        print(f"  delta.shape = {delta.shape}")
-        print(f"  A.shape = {A.shape}")
-        print(f"  B.shape = {B.shape}")
-        print(f"  C.shape = {C.shape}")
-        if not use_minimal_kernel:
-            print(f"  D.shape = {D.shape if D is not None else 'None'}")
-            print(f"  z.shape = {z.shape if z is not None else 'None'}")
-            print(f"  delta_bias.shape = {delta_bias.shape if delta_bias is not None else 'None'}")
-        print(f"Output types:")
-        print(f"  output_type.shape = {output_type.shape}")
-        print(f"  x_checkpoint_type.shape = {x_checkpoint_type.shape}")
-        print(f"  out_z_type.shape = {out_z_type.shape}")
-        print(f"Parameters:")
-        print(f"  delta_softplus = {delta_softplus}")
-        print(f"  device = {device}")
-        print(f"  has_z = {has_z}, has_D = {has_D}, has_delta_bias = {has_delta_bias}")
-        print(f"  use_minimal_kernel = {use_minimal_kernel}")
-        print(f"  batch_dim = {batch_dim}, dim_dim = {dim_dim}, seqlen = {seqlen}, dstate = {dstate}")
-        print(f"  n_chunks = {n_chunks}")
-    
     # Call custom operation - use minimal kernel when no optional params
     if use_minimal_kernel:
         # Use minimal kernel that doesn't require D, z, delta_bias tensors

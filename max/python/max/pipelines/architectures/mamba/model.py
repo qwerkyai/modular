@@ -79,8 +79,7 @@ def _get_kernel_library_paths() -> list[Path]:
         return []
 
     paths: list[Path] = []
-    logger.debug(f"Searching for MambaKernelAPI.mojopkg in MODULAR_MOJO_MAX_IMPORT_PATH: {import_path_env}")
-    
+
     for entry in import_path_env.split(","):
         if not entry.strip():
             continue
@@ -97,7 +96,6 @@ def _get_kernel_library_paths() -> list[Path]:
             entry_path = resolved
         
         if not entry_path.exists():
-            logger.debug(f"Path does not exist: {entry_path} (original: {entry.strip()})")
             continue
 
         # If it's already a .mojopkg file, check if it's MambaKernelAPI
@@ -121,7 +119,7 @@ def _get_kernel_library_paths() -> list[Path]:
                     # Continue searching in case there are multiple (shouldn't happen, but be safe)
 
             if not found:
-                logger.debug(f"No MambaKernelAPI.mojopkg found in directory: {entry_path}")
+                pass
 
     if not paths:
         logger.warning(f"No MambaKernelAPI.mojopkg found in MODULAR_MOJO_MAX_IMPORT_PATH: {import_path_env}")
@@ -438,14 +436,8 @@ class MambaModelBase(PipelineModel[TextContext]):
             accumulated_tokens = Tensor.from_numpy(accumulated_np).to(
                 self.devices[0]
             )
-            logger.debug(
-                f"Mamba reprocessing: prev_tokens={prev_tokens_np.tolist()}, "
-                f"new_token={next_tokens_np.tolist()}, "
-                f"accumulated={accumulated_np.tolist()}"
-            )
         else:
             accumulated_tokens = next_tokens
-            logger.debug(f"Mamba first step: tokens={next_tokens.to_numpy().tolist()}")
         
         # Update row offsets for the accumulated sequence
         # For batch_size=1: offsets = [0, accumulated_length]
@@ -459,7 +451,6 @@ class MambaModelBase(PipelineModel[TextContext]):
             dtype=np.uint32,
         )
         input_row_offsets = Tensor.from_numpy(row_offsets).to(self.devices[0])
-        logger.debug(f"Mamba row_offsets: {row_offsets.tolist()}")
 
         return MambaInputs(
             tokens=accumulated_tokens,

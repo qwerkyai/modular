@@ -154,11 +154,7 @@ class TestSelectiveScanFn:
     ) -> None:
         """Minimal GPU test - no optional params, simplest possible case."""
         batch, dim, seqlen, dstate, n_groups = 1, 2, 4, 2, 1
-        
-        print(f"\n=== MINIMAL GPU TEST ===")
-        print(f"batch={batch}, dim={dim}, seqlen={seqlen}, dstate={dstate}, n_groups={n_groups}")
-        print(f"device={device}")
-        
+
         # Create simple test data
         np.random.seed(42)
         u = np.random.randn(batch, dim, seqlen).astype(np.float32)
@@ -166,15 +162,7 @@ class TestSelectiveScanFn:
         A = -np.random.rand(dim, dstate).astype(np.float32)  # Negative for stability
         B = np.random.randn(batch, n_groups, dstate, seqlen).astype(np.float32)
         C = np.random.randn(batch, n_groups, dstate, seqlen).astype(np.float32)
-        
-        print(f"\n=== NumPy array info ===")
-        print(f"u.shape={u.shape}, contiguous={u.flags.c_contiguous}")
-        print(f"u.strides={u.strides}  # byte strides")
-        print(f"u expected element strides = ({dim*seqlen}, {seqlen}, 1)")
-        print(f"B.shape={B.shape}, contiguous={B.flags.c_contiguous}")
-        print(f"B.strides={B.strides}  # byte strides")
-        print(f"B expected element strides = ({n_groups*dstate*seqlen}, {dstate*seqlen}, {seqlen}, 1)")
-        
+
         dtype = DType.float32
         # Only required inputs - no D, z, or delta_bias
         input_types = [
@@ -184,25 +172,20 @@ class TestSelectiveScanFn:
             TensorType(dtype, [batch, n_groups, dstate, seqlen], device),  # B
             TensorType(dtype, [batch, n_groups, dstate, seqlen], device),  # C
         ]
-        
+
         graph = Graph(
             "test_selective_scan_minimal",
             input_types=input_types,
             custom_extensions=mamba_kernel_path,
         )
-        
+
         with graph:
             u_val = graph.inputs[0].tensor
             delta_val = graph.inputs[1].tensor
             A_val = graph.inputs[2].tensor
             B_val = graph.inputs[3].tensor
             C_val = graph.inputs[4].tensor
-            
-            print(f"Graph tensor shapes:")
-            print(f"  u_val.shape = {u_val.shape}")
-            print(f"  A_val.shape = {A_val.shape}")
-            print(f"  B_val.shape = {B_val.shape}")
-            
+
             # Call with minimal params - no D, z, or delta_bias
             output = selective_scan_fn(
                 u=u_val,
@@ -217,11 +200,9 @@ class TestSelectiveScanFn:
             )
             assert not isinstance(output, tuple)
             graph.output(output)
-        
-        print("Loading model...")
+
         compiled_model = session.load(graph)
-        
-        print("Creating input tensors...")
+
         inputs = [
             Tensor.from_numpy(u).to(session.devices[0]),
             Tensor.from_numpy(delta).to(session.devices[0]),
@@ -229,16 +210,10 @@ class TestSelectiveScanFn:
             Tensor.from_numpy(B).to(session.devices[0]),
             Tensor.from_numpy(C).to(session.devices[0]),
         ]
-        
-        for i, inp in enumerate(inputs):
-            print(f"  input[{i}].shape={inp.shape}, device={inp.device}")
-        
-        print("Executing...")
+
         results = compiled_model.execute(*inputs)
-        
-        print(f"Output shape: {results[0].shape}")
+
         assert results[0].shape == (batch, dim, seqlen)
-        print("Minimal GPU test passed!")
     
     def test_selective_scan_cpu_only(
         self, mamba_kernel_path: list[Path]
@@ -247,19 +222,13 @@ class TestSelectiveScanFn:
         # Force CPU device
         cpu_session = InferenceSession(devices=[CPU()])
         cpu_device = DeviceRef.CPU()
-        
+
         batch, dim, seqlen, dstate, n_groups = 2, 4, 8, 2, 1
-        
-        print(f"\n=== CPU-ONLY DEBUG TEST ===")
-        print(f"batch={batch}, dim={dim}, seqlen={seqlen}, dstate={dstate}, n_groups={n_groups}")
-        
+
         u, delta, A, B, C, D, z, delta_bias = create_test_data(
             batch, dim, seqlen, dstate, n_groups
         )
-        
-        print(f"u.shape={u.shape}, contiguous={u.flags.c_contiguous}")
-        print(f"B.shape={B.shape}, contiguous={B.flags.c_contiguous}")
-        
+
         dtype = DType.float32
         input_types = [
             TensorType(dtype, [batch, dim, seqlen], cpu_device),  # u
@@ -269,13 +238,13 @@ class TestSelectiveScanFn:
             TensorType(dtype, [batch, n_groups, dstate, seqlen], cpu_device),  # C
             TensorType(dtype, [dim], cpu_device),  # D
         ]
-        
+
         graph = Graph(
             "test_selective_scan_cpu_only",
             input_types=input_types,
             custom_extensions=mamba_kernel_path,
         )
-        
+
         with graph:
             u_val = graph.inputs[0].tensor
             delta_val = graph.inputs[1].tensor
@@ -283,7 +252,7 @@ class TestSelectiveScanFn:
             B_val = graph.inputs[3].tensor
             C_val = graph.inputs[4].tensor
             D_val = graph.inputs[5].tensor
-            
+
             output = selective_scan_fn(
                 u=u_val,
                 delta=delta_val,
@@ -295,10 +264,9 @@ class TestSelectiveScanFn:
             )
             assert not isinstance(output, tuple)
             graph.output(output)
-        
-        print("Loading model on CPU...")
+
         compiled_model = cpu_session.load(graph)
-        
+
         inputs = [
             Tensor.from_numpy(u).to(cpu_session.devices[0]),
             Tensor.from_numpy(delta).to(cpu_session.devices[0]),
@@ -307,15 +275,12 @@ class TestSelectiveScanFn:
             Tensor.from_numpy(C).to(cpu_session.devices[0]),
             Tensor.from_numpy(D).to(cpu_session.devices[0]),
         ]
-        
-        print("Executing on CPU...")
+
         results = compiled_model.execute(*inputs)
-        
+
         assert len(results) == 1
         output_tensor = results[0]
-        print(f"Output shape: {output_tensor.shape}")
         assert output_tensor.shape == (batch, dim, seqlen)
-        print("CPU test passed!")
     
     def test_selective_scan_minimal_cpu(
         self, mamba_kernel_path: list[Path]
@@ -327,8 +292,6 @@ class TestSelectiveScanFn:
         
         batch, dim, seqlen, dstate, n_groups = 2, 4, 8, 2, 1
         
-        print(f"\n=== MINIMAL CPU TEST ===")
-        print(f"batch={batch}, dim={dim}, seqlen={seqlen}, dstate={dstate}, n_groups={n_groups}")
         
         np.random.seed(42)
         u = np.random.randn(batch, dim, seqlen).astype(np.float32)
@@ -374,7 +337,6 @@ class TestSelectiveScanFn:
             assert not isinstance(output, tuple)
             graph.output(output)
         
-        print("Loading model on CPU...")
         compiled_model = cpu_session.load(graph)
         
         inputs = [
@@ -385,14 +347,11 @@ class TestSelectiveScanFn:
             Tensor.from_numpy(C).to(cpu_session.devices[0]),
         ]
         
-        print("Executing on CPU...")
         results = compiled_model.execute(*inputs)
         
         assert len(results) == 1
         output_tensor = results[0]
-        print(f"Output shape: {output_tensor.shape}")
         assert output_tensor.shape == (batch, dim, seqlen)
-        print("Minimal CPU test passed!")
     
     def test_selective_scan_debug(
         self, session: InferenceSession, device: DeviceRef, mamba_kernel_path: list[Path]
@@ -400,27 +359,14 @@ class TestSelectiveScanFn:
         """Debug test to print tensor information."""
         batch, dim, seqlen, dstate, n_groups = 2, 4, 8, 2, 1
         
-        print(f"\n=== DEBUG: Test parameters ===")
-        print(f"batch={batch}, dim={dim}, seqlen={seqlen}, dstate={dstate}, n_groups={n_groups}")
-        print(f"device={device}")
         
         # Create test data
         u, delta, A, B, C, D, z, delta_bias = create_test_data(
             batch, dim, seqlen, dstate, n_groups
         )
         
-        print(f"\n=== DEBUG: NumPy array shapes ===")
-        print(f"u.shape={u.shape}, u.strides={u.strides}, u.flags.c_contiguous={u.flags.c_contiguous}")
-        print(f"delta.shape={delta.shape}, delta.strides={delta.strides}, delta.flags.c_contiguous={delta.flags.c_contiguous}")
-        print(f"A.shape={A.shape}, A.strides={A.strides}, A.flags.c_contiguous={A.flags.c_contiguous}")
-        print(f"B.shape={B.shape}, B.strides={B.strides}, B.flags.c_contiguous={B.flags.c_contiguous}")
-        print(f"C.shape={C.shape}, C.strides={C.strides}, C.flags.c_contiguous={C.flags.c_contiguous}")
-        print(f"D.shape={D.shape}, D.strides={D.strides}, D.flags.c_contiguous={D.flags.c_contiguous}")
         
         # Expected strides for contiguous tensors (in bytes, float32 = 4 bytes)
-        print(f"\n=== DEBUG: Expected strides for contiguous tensors ===")
-        print(f"u: expected row-major strides = ({dim*seqlen*4}, {seqlen*4}, {4})")
-        print(f"B: expected row-major strides = ({n_groups*dstate*seqlen*4}, {dstate*seqlen*4}, {seqlen*4}, {4})")
         
         dtype = DType.float32
         input_types = [
@@ -432,7 +378,6 @@ class TestSelectiveScanFn:
             TensorType(dtype, [dim], device),  # D
         ]
         
-        print(f"\n=== DEBUG: Creating graph ===")
         graph = Graph(
             "test_selective_scan_debug",
             input_types=input_types,
@@ -447,13 +392,6 @@ class TestSelectiveScanFn:
             C_val = graph.inputs[4].tensor
             D_val = graph.inputs[5].tensor
             
-            print(f"\n=== DEBUG: Graph tensor shapes ===")
-            print(f"u_val.shape={u_val.shape}")
-            print(f"delta_val.shape={delta_val.shape}")
-            print(f"A_val.shape={A_val.shape}")
-            print(f"B_val.shape={B_val.shape}")
-            print(f"C_val.shape={C_val.shape}")
-            print(f"D_val.shape={D_val.shape}")
             
             output = selective_scan_fn(
                 u=u_val,
@@ -467,10 +405,8 @@ class TestSelectiveScanFn:
             assert not isinstance(output, tuple)
             graph.output(output)
         
-        print(f"\n=== DEBUG: Loading model ===")
         compiled_model = session.load(graph)
         
-        print(f"\n=== DEBUG: Creating input tensors ===")
         inputs = [
             Tensor.from_numpy(u).to(session.devices[0]),
             Tensor.from_numpy(delta).to(session.devices[0]),
@@ -481,17 +417,12 @@ class TestSelectiveScanFn:
         ]
         
         for i, inp in enumerate(inputs):
-            print(f"input[{i}].shape={inp.shape}, dtype={inp.dtype}")
         
-        print(f"\n=== DEBUG: Executing model ===")
         results = compiled_model.execute(*inputs)
         
-        print(f"\n=== DEBUG: Results ===")
         assert len(results) == 1
         output_tensor = results[0]
-        print(f"output.shape={output_tensor.shape}")
         assert output_tensor.shape == (batch, dim, seqlen)
-        print("Test passed!")
     
     def test_selective_scan_basic(
         self, session: InferenceSession, device: DeviceRef, mamba_kernel_path: list[Path]
