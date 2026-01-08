@@ -103,7 +103,7 @@ class Mamba(Module):
                     mlp=None,  # TODO: Add MLP support if needed
                     norm=create_norm(),
                     norm2=None,
-                    fused_add_norm=False,  # Disabled for debugging - config.fused_add_norm,
+                    fused_add_norm=True,  # Enable fused path
                     residual_in_fp32=config.residual_in_fp32,
                 )
             )

@@ -447,3 +447,13 @@ def main():
     # Test larger sequences
     run_causal_conv1d_gpu[DType.float32, "none"](2, 16, 128, 3, ctx=ctx)
     print("✓ Large sequence GPU test passed")
+    
+    # Test with mamba-130m-hf realistic dimensions
+    # dim=1536, width=4 (conv_kernel)
+    for seqlen in [5, 6, 7]:
+        run_causal_conv1d_gpu[DType.float32, "silu"](1, 1536, seqlen, 4, ctx=ctx)
+        print("✓ Mamba-130m causal conv1d seqlen=" + String(seqlen) + " passed")
+    
+    # Strict tolerance test
+    run_causal_conv1d_gpu[DType.float32, "silu"](1, 1536, 7, 4, ctx=ctx, rtol=0.0001)
+    print("✓ Strict tolerance (0.01%) causal conv1d seqlen=7 passed")
