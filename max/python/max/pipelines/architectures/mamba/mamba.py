@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-import functools
+from functools import partial
 from collections.abc import Callable, Sequence
 
 from max.dtype import DType
@@ -26,7 +26,10 @@ from max.nn import (
     Linear,
     Module,
     LayerNorm,
-    FusedRMSNorm
+    FusedRMSNorm,
+    Identity,
+    GatedMLP,
+    Conv1D
 )
 from max.nn.mamba import Block, MambaSSM
 from max.pipelines.lib.lora import LoRAManager
@@ -37,6 +40,7 @@ from .model_config import MambaConfig
 class Mamba(Module):
     def __init__(self, config: MambaConfig) -> None:
         assert len(config.devices) == 1
+        super().__init__()
         self.config = config
 
         # Select norm layer class.
@@ -46,15 +50,15 @@ class Mamba(Module):
                 raise ValueError(
                     "rms_norm_eps cannot be None for model that uses RMSNorm."
                 )
-            create_norm = functools.partial(
-                RMSNorm,
+            create_norm = partial(
+                FusedRMSNorm,
                 config.hidden_size,
                 config.norm_dtype or config.dtype,
                 config.rms_norm_eps,
                 multiply_before_cast=False,
             )
         else:
-            create_norm = functools.partial(
+            create_norm = partial(
                 ConstantLayerNorm,
                 config.hidden_size,
                 config.devices[0],
@@ -64,7 +68,7 @@ class Mamba(Module):
         # Select linear layer class.
         linear_cls: Callable[..., Linear]
 
-        linear_cls = functools.partial(
+        linear_cls = partial(
             Linear, float8_config=config.float8_config
         )
 
@@ -79,9 +83,17 @@ class Mamba(Module):
                 linear_cls=linear_cls,
                 d_state=config.d_state,
                 dt_rank=config.dt_rank if config.dt_rank is not None else "auto",
-                conv_bias=True,  # Use conv_bias from config if available
+                conv_bias=config.use_conv_bias,
+                bias=config.use_bias,
+                delta_softplus=True,  # Always True for Mamba
                 conv_kernel=config.conv_kernel,
                 x_proj_dim=config.x_proj_dim,
+                dt_min=config.time_step_min,
+                dt_max=config.time_step_max,
+                dt_init=config.time_step_init_scheme,
+                dt_scale=config.time_step_scale,
+                dt_init_floor=config.time_step_floor,
+                use_fast_path=True,  # Use fast path when available
                 layer_idx=i,  # Pass layer index for inference caching
             )
             layers.append(
@@ -91,8 +103,8 @@ class Mamba(Module):
                     mlp=None,  # TODO: Add MLP support if needed
                     norm=create_norm(),
                     norm2=None,
-                    fused_add_norm=False,
-                    residual_in_fp32=False,
+                    fused_add_norm=config.fused_add_norm,
+                    residual_in_fp32=config.residual_in_fp32,
                 )
             )
 
@@ -131,14 +143,15 @@ class Mamba(Module):
         tokens: TensorValue,
         return_n_logits: TensorValue,
         input_row_offsets: TensorValue,
+        **kwargs,
     ) -> tuple[TensorValue, ...]:
         """Forward pass through the Mamba model.
-        
+
         Args:
             tokens: Input token IDs.
             return_n_logits: Number of logits to return.
             input_row_offsets: Row offsets for ragged tensor processing.
-            
+
         Returns:
             Tuple of output tensors (logits, and optionally offsets and hidden states).
         """
@@ -159,7 +172,8 @@ class Mamba(Module):
         h = self.norm(h)
         
         # Get last token logits
-        last_h = ops.gather(h, input_row_offsets[1:] - 1, axis=0)
+        last_token_indices = input_row_offsets[1:] - 1
+        last_h = ops.gather(h, last_token_indices, axis=0)
         last_logits = ops.cast(self.output(last_h), DType.float32)
         
         # TODO: Implement variable logits and hidden states return logic
@@ -199,6 +213,11 @@ class Mamba(Module):
                 lora_ids_kv,
                 lora_grouped_offsets_kv,
             ) = lora_manager.get_symbolic_inputs(device_ref)
+            # Add seqlen_offset for SSM state caching
+            seqlen_offset_type = TensorType(
+                DType.int32, shape=["seqlen_offset"], device=DeviceRef.CPU()
+            )
+
             return (
                 tokens_type,
                 input_row_offsets_type,
@@ -219,12 +238,22 @@ class Mamba(Module):
                 shape=["total_seq_len", self.config.hidden_size],
                 device=device_ref,
             )
+            # Add seqlen_offset for SSM state caching
+            seqlen_offset_type = TensorType(
+                DType.int32, shape=["seqlen_offset"], device=DeviceRef.CPU()
+            )
+
             return (
                 tokens_type,
                 input_row_offsets_type,
                 return_n_logits_type,
                 hidden_states_type,
             )
+
+        # Add seqlen_offset for SSM state caching
+        seqlen_offset_type = TensorType(
+            DType.int32, shape=["seqlen_offset"], device=DeviceRef.CPU()
+        )
 
         return (
             tokens_type,

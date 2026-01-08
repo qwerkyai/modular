@@ -2315,18 +2315,28 @@ fn causal_conv1d_update_cpu[
     - New x values are appended, old values are shifted out
     
     Args:
-        batch: Batch size
-        dim: Number of channels
-        seqlen: Sequence length of input x (typically 1)
-        width: Kernel width
-        state_len: Length of conv_state (>= width - 1)
-        x: Input tensor
-        conv_state: Convolution state buffer (modified in-place)
-        weight: Convolution weights
-        output: Output tensor
-        bias: Bias tensor
-        ..._stride: Tensor strides
-        silu_activation: Whether to apply SiLU activation
+        batch: Batch size.
+        dim: Number of channels.
+        seqlen: Sequence length of input x (typically 1).
+        width: Kernel width.
+        state_len: Length of conv_state (>= width - 1).
+        x: Input tensor.
+        conv_state: Convolution state buffer (modified in-place).
+        weight: Convolution weights.
+        output: Output tensor.
+        bias: Bias tensor.
+        x_batch_stride: Stride for batch dimension in x.
+        x_c_stride: Stride for channel dimension in x.
+        x_l_stride: Stride for sequence length dimension in x.
+        conv_state_batch_stride: Stride for batch dimension in conv_state.
+        conv_state_c_stride: Stride for channel dimension in conv_state.
+        conv_state_l_stride: Stride for state length dimension in conv_state.
+        weight_c_stride: Stride for channel dimension in weight.
+        weight_width_stride: Stride for kernel width dimension in weight.
+        out_batch_stride: Stride for batch dimension in output.
+        out_c_stride: Stride for channel dimension in output.
+        out_l_stride: Stride for sequence length dimension in output.
+        silu_activation: Whether to apply SiLU activation.
     """
     var width_minus_1: Int = width - 1
     

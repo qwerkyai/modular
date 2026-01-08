@@ -21,7 +21,7 @@ from layout import (
     RuntimeLayout,
 )
 from layout._fillers import random
-from memory import UnsafePointer
+from memory import alloc
 from nn.selective_scan import (
     mamba_split_conv1d_scan_combined_cpu,
     mamba_split_conv1d_scan_combined_gpu,
@@ -57,40 +57,40 @@ fn run_mamba_split_conv1d_scan_combined_gpu[
     # Allocate host memory
     var zxbcdt_channels = 2 * dim + 2 * ngroups * dstate + nheads
     var zxbcdt_size = batch * seqlen * zxbcdt_channels
-    var zxbcdt_h = UnsafePointer[Scalar[dtype]].alloc(zxbcdt_size)
+    var zxbcdt_h = alloc[Scalar[dtype]](zxbcdt_size)
     var conv_weight_channels = dim + 2 * ngroups * dstate
     var conv_weight_size = conv_weight_channels * width
-    var conv_weight_h = UnsafePointer[Scalar[dtype]].alloc(conv_weight_size)
+    var conv_weight_h = alloc[Scalar[dtype]](conv_weight_size)
     var conv_bias_size = conv_weight_channels
-    var conv_bias_h = UnsafePointer[Scalar[dtype]].alloc(conv_bias_size)
+    var conv_bias_h = alloc[Scalar[dtype]](conv_bias_size)
     var dt_bias_size = nheads
-    var dt_bias_h = UnsafePointer[Scalar[dtype]].alloc(dt_bias_size)
+    var dt_bias_h = alloc[Scalar[dtype]](dt_bias_size)
     var A_size = nheads
-    var A_h = UnsafePointer[Scalar[dtype]].alloc(A_size)
+    var A_h = alloc[Scalar[dtype]](A_size)
     var D_size = nheads * headdim if has_D else 0
-    var D_h = UnsafePointer[Scalar[dtype]].alloc(max(D_size, 1))
+    var D_h = alloc[Scalar[dtype]](max(D_size, 1))
     var x_size = batch * dim * n_chunks * 2 * dstate
-    var x_h = UnsafePointer[Scalar[dtype]].alloc(x_size)
+    var x_h = alloc[Scalar[dtype]](x_size)
     var out_z_size = batch * dim * seqlen
-    var out_z_h = UnsafePointer[Scalar[dtype]].alloc(out_z_size)
+    var out_z_h = alloc[Scalar[dtype]](out_z_size)
     var dt_size = batch * nheads * seqlen
-    var dt_h = UnsafePointer[Scalar[dtype]].alloc(dt_size)
+    var dt_h = alloc[Scalar[dtype]](dt_size)
     var B_size = batch * ngroups * dstate * seqlen
-    var B_h = UnsafePointer[Scalar[dtype]].alloc(B_size)
+    var B_h = alloc[Scalar[dtype]](B_size)
     var C_size = batch * ngroups * dstate * seqlen
-    var C_h = UnsafePointer[Scalar[dtype]].alloc(C_size)
+    var C_h = alloc[Scalar[dtype]](C_size)
     var z_size = batch * dim * seqlen
-    var z_h = UnsafePointer[Scalar[dtype]].alloc(z_size)
+    var z_h = alloc[Scalar[dtype]](z_size)
     var rmsnorm_weight_size = dim if has_rmsnorm else 0
-    var rmsnorm_weight_h = UnsafePointer[Scalar[dtype]].alloc(max(rmsnorm_weight_size, 1))
+    var rmsnorm_weight_h = alloc[Scalar[dtype]](max(rmsnorm_weight_size, 1))
     var out_dim = dim
     var outproj_weight_size = out_dim * dim if has_outproj else 0
-    var outproj_weight_h = UnsafePointer[Scalar[dtype]].alloc(max(outproj_weight_size, 1))
+    var outproj_weight_h = alloc[Scalar[dtype]](max(outproj_weight_size, 1))
     var outproj_bias_size = out_dim if has_outproj else 0
-    var outproj_bias_h = UnsafePointer[Scalar[dtype]].alloc(max(outproj_bias_size, 1))
+    var outproj_bias_h = alloc[Scalar[dtype]](max(outproj_bias_size, 1))
     var output_size = batch * seqlen * (out_dim if has_outproj else dim)
-    var output_cpu_h = UnsafePointer[Scalar[dtype]].alloc(output_size)
-    var output_gpu_h = UnsafePointer[Scalar[dtype]].alloc(output_size)
+    var output_cpu_h = alloc[Scalar[dtype]](output_size)
+    var output_gpu_h = alloc[Scalar[dtype]](output_size)
     
     # Create LayoutTensors for initialization
     comptime layout_3d = Layout.row_major(UNKNOWN_VALUE)
@@ -351,9 +351,9 @@ fn run_mamba_split_conv1d_scan_combined_gpu[
         width,
         chunk_size,
         Int8(1) if delta_softplus else Int8(0),
-        norm_before_gate,
-        has_rmsnorm,
-        has_outproj,
+        Int8(1) if norm_before_gate else Int8(0),
+        Int8(1) if has_rmsnorm else Int8(0),
+        Int8(1) if has_outproj else Int8(0),
         zxbcdt_cpu_lt,
         conv_weight_cpu_lt,
         conv_bias_cpu_lt,
@@ -470,9 +470,9 @@ fn run_mamba_split_conv1d_scan_combined_gpu[
         width,
         chunk_size,
         Int8(1) if delta_softplus else Int8(0),
-        norm_before_gate,
-        has_rmsnorm,
-        has_outproj,
+        Int8(1) if norm_before_gate else Int8(0),
+        Int8(1) if has_rmsnorm else Int8(0),
+        Int8(1) if has_outproj else Int8(0),
         zxbcdt_gpu_lt,
         conv_weight_gpu_lt,
         conv_bias_gpu_lt,

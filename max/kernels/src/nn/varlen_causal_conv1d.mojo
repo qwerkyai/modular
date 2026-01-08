@@ -677,7 +677,7 @@ fn causal_conv1d_varlen_fwd_gpu[
         var weight_offset = d * weight_dim_stride + w_idx * weight_width_stride
         weights[w_idx] = weight.ptr.offset(weight_offset).load()
 
-    alias WIDTH_MINUS_1 = WIDTH - 1
+    comptime WIDTH_MINUS_1 = WIDTH - 1
 
     # Process sequence
     for l in range(seqlen):
@@ -819,7 +819,7 @@ fn causal_conv1d_varlen_update_gpu[
         var weight_offset = d * weight_dim_stride + w_idx * weight_width_stride
         weights[w_idx] = weight.ptr.offset(weight_offset).load()
 
-    alias WIDTH_MINUS_1 = WIDTH - 1
+    comptime WIDTH_MINUS_1 = WIDTH - 1
 
     for l in range(seqlen):
         # Get cache position

@@ -185,6 +185,17 @@ fn selective_scan_fwd_gpu[
     var curr_C_offset = UInt32(b) * C_b_stride + UInt32(group_id) * C_g_stride
     var curr_z_offset = UInt32(b) * z_b_stride + UInt32(d) * z_d_stride
     var curr_out_z_offset = UInt32(b) * out_z_b_stride + UInt32(d) * out_z_d_stride
+
+    # Bounds checking for tensor access
+    # Disabled for now - the kernel assumes valid tensor layouts from the framework
+    # TODO: Implement proper bounds checking based on actual tensor sizes
+    var u_total_size = UInt32.MAX
+    var delta_total_size = UInt32.MAX
+    var B_total_size = UInt32.MAX
+    var C_total_size = UInt32.MAX
+    var output_total_size = UInt32.MAX
+    var z_total_size = UInt32.MAX
+    var out_z_total_size = UInt32.MAX
     
     # Process sequence sequentially for this (batch, dim)
     # OPTIMIZED: Tiled loading with pre-loaded B/C tiles and buffered outputs
@@ -193,7 +204,7 @@ fn selective_scan_fwd_gpu[
     var t = 0
     
     # Check if we can use contiguous loads (stride == 1)
-    var u_contiguous = u_t_stride == 1
+    # Note: u tensor always uses strided access to handle different layouts from causal_conv1d_fn
     var delta_contiguous = delta_t_stride == 1
     var z_contiguous = z_t_stride == 1
     var B_contiguous = B_t_stride == 1
@@ -207,24 +218,25 @@ fn selective_scan_fwd_gpu[
         var delta_vec = SIMD[kernel_dtype, TILE_SIZE](0.0)
         var z_vec = SIMD[kernel_dtype, TILE_SIZE](0.0)
         
-        if u_contiguous:
-            u_vec = u.ptr.offset(curr_u_offset).load[width=TILE_SIZE]()
-        else:
-            for i in range(TILE_SIZE):
-                u_vec[i] = u.ptr.offset(curr_u_offset + UInt32(i) * u_t_stride).load()
-                
-        if delta_contiguous:
-            delta_vec = delta.ptr.offset(curr_delta_offset).load[width=TILE_SIZE]()
-        else:
-            for i in range(TILE_SIZE):
-                delta_vec[i] = delta.ptr.offset(curr_delta_offset + UInt32(i) * delta_t_stride).load()
-                
+        # Always use strided access for u tensor to handle different layouts
+        # from causal_conv1d_fn and other operations
+        for i in range(TILE_SIZE):
+            var u_offset = curr_u_offset + UInt32(i) * u_t_stride
+            if u_offset >= u_total_size:
+                return  # Invalid access - early exit
+            u_vec[i] = u.ptr.offset(u_offset).load()
+
+        # Always use strided access for delta tensor to handle different layouts
+        for i in range(TILE_SIZE):
+            var delta_offset = curr_delta_offset + UInt32(i) * delta_t_stride
+            if delta_offset >= delta_total_size:
+                return  # Invalid access - early exit
+            delta_vec[i] = delta.ptr.offset(delta_offset).load()
+
         if has_z:
-            if z_contiguous:
-                z_vec = z.ptr.offset(curr_z_offset).load[width=TILE_SIZE]()
-            else:
-                for i in range(TILE_SIZE):
-                    z_vec[i] = z.ptr.offset(curr_z_offset + UInt32(i) * z_t_stride).load()
+            # Always use strided access for z tensor to handle different layouts
+            for i in range(TILE_SIZE):
+                z_vec[i] = z.ptr.offset(curr_z_offset + UInt32(i) * z_t_stride).load()
         
         # PRE-LOAD B/C TILES: Load B[n, t:t+TILE] and C[n, t:t+TILE] for all n
         # This avoids redundant address calculations inside the inner loop
@@ -263,115 +275,173 @@ fn selective_scan_fwd_gpu[
         var C_tile_14 = SIMD[DType.float32, TILE_SIZE](0.0)
         var C_tile_15 = SIMD[DType.float32, TILE_SIZE](0.0)
         
-        # Load B tiles - vector load if B is contiguous in t
-        if B_contiguous:
+        # Load B tiles - always use scalar loads to handle different layouts from slicing/reshaping
+        for i in range(TILE_SIZE):
+            var b_base = curr_B_offset + UInt32(i) * B_t_stride
             if dstate > 0:
-                B_tile_0 = B.ptr.offset(curr_B_offset + UInt32(0) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(0) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_0[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 1:
-                B_tile_1 = B.ptr.offset(curr_B_offset + UInt32(1) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(1) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_1[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 2:
-                B_tile_2 = B.ptr.offset(curr_B_offset + UInt32(2) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(2) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_2[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 3:
-                B_tile_3 = B.ptr.offset(curr_B_offset + UInt32(3) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(3) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_3[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 4:
-                B_tile_4 = B.ptr.offset(curr_B_offset + UInt32(4) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(4) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_4[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 5:
-                B_tile_5 = B.ptr.offset(curr_B_offset + UInt32(5) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(5) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_5[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 6:
-                B_tile_6 = B.ptr.offset(curr_B_offset + UInt32(6) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(6) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_6[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 7:
-                B_tile_7 = B.ptr.offset(curr_B_offset + UInt32(7) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(7) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_7[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 8:
-                B_tile_8 = B.ptr.offset(curr_B_offset + UInt32(8) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(8) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_8[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 9:
-                B_tile_9 = B.ptr.offset(curr_B_offset + UInt32(9) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(9) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_9[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 10:
-                B_tile_10 = B.ptr.offset(curr_B_offset + UInt32(10) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(10) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_10[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 11:
-                B_tile_11 = B.ptr.offset(curr_B_offset + UInt32(11) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(11) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_11[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 12:
-                B_tile_12 = B.ptr.offset(curr_B_offset + UInt32(12) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(12) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_12[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 13:
-                B_tile_13 = B.ptr.offset(curr_B_offset + UInt32(13) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(13) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_13[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 14:
-                B_tile_14 = B.ptr.offset(curr_B_offset + UInt32(14) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var b_offset = b_base + UInt32(14) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_14[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
             if dstate > 15:
-                B_tile_15 = B.ptr.offset(curr_B_offset + UInt32(15) * B_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
-        else:
-            # Scalar fallback for non-contiguous B
-            for i in range(TILE_SIZE):
-                var b_base = curr_B_offset + UInt32(i) * B_t_stride
-                if dstate > 0: B_tile_0[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(0) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 1: B_tile_1[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(1) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 2: B_tile_2[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(2) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 3: B_tile_3[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(3) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 4: B_tile_4[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(4) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 5: B_tile_5[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(5) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 6: B_tile_6[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(6) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 7: B_tile_7[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(7) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 8: B_tile_8[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(8) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 9: B_tile_9[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(9) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 10: B_tile_10[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(10) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 11: B_tile_11[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(11) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 12: B_tile_12[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(12) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 13: B_tile_13[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(13) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 14: B_tile_14[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(14) * B_n_stride).load()).cast[DType.float32]()
-                if dstate > 15: B_tile_15[i] = Scalar[kernel_dtype](B.ptr.offset(b_base + UInt32(15) * B_n_stride).load()).cast[DType.float32]()
+                var b_offset = b_base + UInt32(15) * B_n_stride
+                if b_offset >= B_total_size:
+                    return  # Invalid access - early exit
+                B_tile_15[i] = Scalar[kernel_dtype](B.ptr.offset(b_offset).load()).cast[DType.float32]()
         
-        # Load C tiles - vector load if C is contiguous in t
-        if C_contiguous:
+        # Load C tiles - always use scalar loads to handle different layouts from slicing/reshaping
+        for i in range(TILE_SIZE):
+            var c_base = curr_C_offset + UInt32(i) * C_t_stride
             if dstate > 0:
-                C_tile_0 = C.ptr.offset(curr_C_offset + UInt32(0) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(0) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_0[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 1:
-                C_tile_1 = C.ptr.offset(curr_C_offset + UInt32(1) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(1) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_1[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 2:
-                C_tile_2 = C.ptr.offset(curr_C_offset + UInt32(2) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(2) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_2[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 3:
-                C_tile_3 = C.ptr.offset(curr_C_offset + UInt32(3) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(3) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_3[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 4:
-                C_tile_4 = C.ptr.offset(curr_C_offset + UInt32(4) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(4) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_4[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 5:
-                C_tile_5 = C.ptr.offset(curr_C_offset + UInt32(5) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(5) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_5[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 6:
-                C_tile_6 = C.ptr.offset(curr_C_offset + UInt32(6) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(6) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_6[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 7:
-                C_tile_7 = C.ptr.offset(curr_C_offset + UInt32(7) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(7) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_7[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 8:
-                C_tile_8 = C.ptr.offset(curr_C_offset + UInt32(8) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(8) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_8[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 9:
-                C_tile_9 = C.ptr.offset(curr_C_offset + UInt32(9) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(9) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_9[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 10:
-                C_tile_10 = C.ptr.offset(curr_C_offset + UInt32(10) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(10) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_10[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 11:
-                C_tile_11 = C.ptr.offset(curr_C_offset + UInt32(11) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(11) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_11[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 12:
-                C_tile_12 = C.ptr.offset(curr_C_offset + UInt32(12) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(12) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_12[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 13:
-                C_tile_13 = C.ptr.offset(curr_C_offset + UInt32(13) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(13) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_13[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 14:
-                C_tile_14 = C.ptr.offset(curr_C_offset + UInt32(14) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
+                var c_offset = c_base + UInt32(14) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_14[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
             if dstate > 15:
-                C_tile_15 = C.ptr.offset(curr_C_offset + UInt32(15) * C_n_stride).load[width=TILE_SIZE]().cast[DType.float32]()
-        else:
-            # Scalar fallback for non-contiguous C
-            for i in range(TILE_SIZE):
-                var c_base = curr_C_offset + UInt32(i) * C_t_stride
-                if dstate > 0: C_tile_0[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(0) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 1: C_tile_1[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(1) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 2: C_tile_2[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(2) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 3: C_tile_3[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(3) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 4: C_tile_4[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(4) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 5: C_tile_5[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(5) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 6: C_tile_6[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(6) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 7: C_tile_7[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(7) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 8: C_tile_8[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(8) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 9: C_tile_9[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(9) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 10: C_tile_10[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(10) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 11: C_tile_11[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(11) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 12: C_tile_12[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(12) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 13: C_tile_13[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(13) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 14: C_tile_14[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(14) * C_n_stride).load()).cast[DType.float32]()
-                if dstate > 15: C_tile_15[i] = Scalar[kernel_dtype](C.ptr.offset(c_base + UInt32(15) * C_n_stride).load()).cast[DType.float32]()
+                var c_offset = c_base + UInt32(15) * C_n_stride
+                if c_offset >= C_total_size:
+                    return  # Invalid access - early exit
+                C_tile_15[i] = Scalar[kernel_dtype](C.ptr.offset(c_offset).load()).cast[DType.float32]()
         
         # Buffer for output values to enable vector stores
         var output_buffer = SIMD[kernel_dtype, TILE_SIZE](0.0)
@@ -471,18 +541,26 @@ fn selective_scan_fwd_gpu[
         
         # Vector store outputs if contiguous
         if output_contiguous:
+            if curr_output_offset + TILE_SIZE > output_total_size:
+                return  # Invalid access - early exit
             output.ptr.offset(curr_output_offset).store[width=TILE_SIZE](output_buffer)
         else:
             for i in range(TILE_SIZE):
                 var out_off = curr_output_offset + UInt32(i) * output_t_stride
+                if out_off >= output_total_size:
+                    return  # Invalid access - early exit
                 output.ptr.offset(out_off).store(output_buffer[i])
         
         if has_z and has_out_z:
             if out_z_t_stride == 1:
+                if curr_out_z_offset + TILE_SIZE > out_z_total_size:
+                    return  # Invalid access - early exit
                 out_z.ptr.offset(curr_out_z_offset).store[width=TILE_SIZE](out_z_buffer)
             else:
                 for i in range(TILE_SIZE):
                     var out_z_off = curr_out_z_offset + UInt32(i) * out_z_t_stride
+                    if out_z_off >= out_z_total_size:
+                        return  # Invalid access - early exit
                     out_z.ptr.offset(out_z_off).store(out_z_buffer[i])
 
         # Advance global offsets by TILE_SIZE
@@ -501,6 +579,8 @@ fn selective_scan_fwd_gpu[
         t_in_chunk += 1
         # ... (same body as original loop) ...
         # Copied from original for correctness
+        if curr_u_offset >= u_total_size or curr_delta_offset >= delta_total_size:
+            return  # Invalid access - early exit
         var u_val = Scalar[kernel_dtype](u.ptr.offset(curr_u_offset).load()).cast[DType.float32]()
         var delta_val = Scalar[kernel_dtype](delta.ptr.offset(curr_delta_offset).load()).cast[DType.float32]()
         if has_delta_bias: delta_val += delta_bias_val
@@ -546,6 +626,148 @@ fn selective_scan_fwd_gpu[
                 chunk_idx += 1
                 t_in_chunk = 0
         t += 1
+
+
+# ===----------------------------------------------------------------------=== #
+# Minimal GPU kernel - no D, z, or delta_bias
+# ===----------------------------------------------------------------------=== #
+# This variant avoids passing empty tensors with null pointers to the GPU.
+# Use this when D, z, and delta_bias are not provided.
+# ===----------------------------------------------------------------------=== #
+
+fn selective_scan_fwd_gpu_minimal[
+    kernel_dtype: DType,
+    output_layout: Layout,
+    x_layout: Layout,
+    u_layout: Layout,
+    delta_layout: Layout,
+    A_layout: Layout,
+    B_layout: Layout,
+    C_layout: Layout,
+](
+    total_batch_dim: Int,
+    batch: Int,
+    dim: Int,
+    seqlen: Int,
+    dstate: Int,
+    group_size: Int,
+    delta_softplus: Int8,
+    output: LayoutTensor[kernel_dtype, output_layout, MutAnyOrigin],
+    x: LayoutTensor[kernel_dtype, x_layout, MutAnyOrigin],
+    u: LayoutTensor[kernel_dtype, u_layout, MutAnyOrigin],
+    delta: LayoutTensor[kernel_dtype, delta_layout, MutAnyOrigin],
+    A: LayoutTensor[kernel_dtype, A_layout, MutAnyOrigin],
+    B: LayoutTensor[kernel_dtype, B_layout, MutAnyOrigin],
+    C: LayoutTensor[kernel_dtype, C_layout, MutAnyOrigin],
+    # Strides
+    output_b_stride: UInt32,
+    output_d_stride: UInt32,
+    output_t_stride: UInt32,
+    x_b_stride: UInt32,
+    x_d_stride: UInt32,
+    x_chunk_stride: UInt32,
+    x_n_stride: UInt32,
+    u_b_stride: UInt32,
+    u_d_stride: UInt32,
+    u_t_stride: UInt32,
+    delta_b_stride: UInt32,
+    delta_d_stride: UInt32,
+    delta_t_stride: UInt32,
+    A_d_stride: UInt32,
+    A_n_stride: UInt32,
+    B_b_stride: UInt32,
+    B_g_stride: UInt32,
+    B_n_stride: UInt32,
+    B_t_stride: UInt32,
+    C_b_stride: UInt32,
+    C_g_stride: UInt32,
+    C_n_stride: UInt32,
+    C_t_stride: UInt32,
+):
+    """Minimal GPU kernel for selective scan - no optional D, z, or delta_bias.
+    
+    This kernel variant avoids passing empty tensors that could have null pointers.
+    Use when D, z, and delta_bias are not provided.
+    """
+    var thread_id = block_dim.x * block_idx.x + thread_idx.x
+    var thread_id_int = Int(thread_id)
+    if thread_id_int >= total_batch_dim:
+        return
+        
+    var b = thread_id_int // dim
+    var d = thread_id_int % dim
+    
+    if b >= batch or d >= dim:
+        return
+        
+    var group_id = d // group_size
+    
+    var state = SIMD[DType.float32, MAX_DSTATE](0.0)
+    var cum_a = SIMD[DType.float32, MAX_DSTATE](1.0)
+    var cum_b = SIMD[DType.float32, MAX_DSTATE](0.0)
+    
+    var A_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+    var delta_softplus_bool = Bool(Int(delta_softplus) != 0)
+    
+    for n in range(dstate):
+        var A_offset = UInt32(d) * A_d_stride + UInt32(n) * A_n_stride
+        A_vals[n] = Scalar[kernel_dtype](A.ptr.offset(A_offset).load()).cast[DType.float32]() * LOG2E
+
+    var chunk_size = 2048
+    var t_in_chunk = 0
+    var chunk_idx = 0
+    
+    var curr_u_offset = UInt32(b) * u_b_stride + UInt32(d) * u_d_stride
+    var curr_delta_offset = UInt32(b) * delta_b_stride + UInt32(d) * delta_d_stride
+    var curr_output_offset = UInt32(b) * output_b_stride + UInt32(d) * output_d_stride
+    var curr_B_offset = UInt32(b) * B_b_stride + UInt32(group_id) * B_g_stride
+    var curr_C_offset = UInt32(b) * C_b_stride + UInt32(group_id) * C_g_stride
+
+    # Simple scalar loop - no tiling for simplicity in minimal version
+    for t in range(seqlen):
+        t_in_chunk += 1
+        
+        var u_val = Scalar[kernel_dtype](u.ptr.offset(curr_u_offset).load()).cast[DType.float32]()
+        var delta_val = Scalar[kernel_dtype](delta.ptr.offset(curr_delta_offset).load()).cast[DType.float32]()
+        if delta_softplus_bool: 
+            delta_val = softplus(delta_val)
+        var delta_u = delta_val * u_val
+        
+        var B_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+        var C_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+        for n in range(dstate):
+            B_vals[n] = Scalar[kernel_dtype](B.ptr.offset(curr_B_offset + UInt32(n) * B_n_stride).load()).cast[DType.float32]()
+            C_vals[n] = Scalar[kernel_dtype](C.ptr.offset(curr_C_offset + UInt32(n) * C_n_stride).load()).cast[DType.float32]()
+        
+        var a_t = exp2(A_vals * delta_val)
+        var b_t = B_vals * delta_u
+        state = state * a_t + b_t
+        var output_val = (state * C_vals).reduce_add()
+        cum_b = cum_b * a_t + b_t
+        cum_a = cum_a * a_t
+        # No D skip connection in minimal version
+        output.ptr.offset(curr_output_offset).store(Scalar[kernel_dtype](output_val.cast[kernel_dtype]()))
+        # No z gating in minimal version
+        
+        curr_u_offset += u_t_stride
+        curr_delta_offset += delta_t_stride
+        curr_output_offset += output_t_stride
+        curr_B_offset += B_t_stride
+        curr_C_offset += C_t_stride
+        
+        var is_chunk_boundary = (t_in_chunk == chunk_size)
+        var is_last_step = (t == seqlen - 1)
+        if is_chunk_boundary or is_last_step:
+            for n in range(dstate):
+                var x_offset_a = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2) * Int(x_n_stride))
+                var x_offset_b = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2 + 1) * Int(x_n_stride))
+                x.ptr.offset(x_offset_a).store(Scalar[kernel_dtype](cum_a[n].cast[kernel_dtype]()))
+                x.ptr.offset(x_offset_b).store(Scalar[kernel_dtype](cum_b[n].cast[kernel_dtype]()))
+                cum_a[n] = 1.0
+                cum_b[n] = 0.0
+            if is_chunk_boundary:
+                chunk_idx += 1
+                t_in_chunk = 0
 
 
 # ===----------------------------------------------------------------------=== #
@@ -633,17 +855,47 @@ fn selective_scan_update_gpu[
     Reads initial state from state_in, writes updated state to state_out.
     
     Args:
-        state_out: Output SSM state tensor (batch, dim, dstate)
-        output: Output tensor (batch, dim)
-        state_in: Input SSM state tensor (batch, dim, dstate)
-        x: Input tensor (batch, dim)
-        dt: Delta/timestep tensor (batch, dim)
-        A: State transition matrix (dim, dstate)
-        B: Input projection (batch, dstate)
-        C: Output projection (batch, dstate)
-        D: Optional skip connection (dim,)
-        z: Optional gate (batch, dim)
-        dt_bias: Optional delta bias (dim,)
+        total_batch_dim: Total number of (batch, dim) pairs to process.
+        batch: Batch size.
+        dim: Hidden dimension size.
+        dstate: State dimension size.
+        group_size: Group size for B and C projections.
+        delta_softplus: Whether to apply softplus to delta values (0 or 1).
+        state_out: Output SSM state tensor (batch, dim, dstate).
+        output: Output tensor (batch, dim).
+        state_in: Input SSM state tensor (batch, dim, dstate).
+        x: Input tensor (batch, dim).
+        dt: Delta/timestep tensor (batch, dim).
+        A: State transition matrix (dim, dstate).
+        B: Input projection (batch, dstate).
+        C: Output projection (batch, dstate).
+        D: Optional skip connection (dim,).
+        z: Optional gate (batch, dim).
+        dt_bias: Optional delta bias (dim,).
+        state_out_b_stride: Stride for batch dimension in state_out.
+        state_out_d_stride: Stride for dim dimension in state_out.
+        state_out_n_stride: Stride for dstate dimension in state_out.
+        output_b_stride: Stride for batch dimension in output.
+        output_d_stride: Stride for dim dimension in output.
+        state_in_b_stride: Stride for batch dimension in state_in.
+        state_in_d_stride: Stride for dim dimension in state_in.
+        state_in_n_stride: Stride for dstate dimension in state_in.
+        x_b_stride: Stride for batch dimension in x.
+        x_d_stride: Stride for dim dimension in x.
+        dt_b_stride: Stride for batch dimension in dt.
+        dt_d_stride: Stride for dim dimension in dt.
+        A_d_stride: Stride for dim dimension in A.
+        A_n_stride: Stride for dstate dimension in A.
+        B_b_stride: Stride for batch dimension in B.
+        B_g_stride: Stride for group dimension in B.
+        B_n_stride: Stride for dstate dimension in B.
+        C_b_stride: Stride for batch dimension in C.
+        C_g_stride: Stride for group dimension in C.
+        C_n_stride: Stride for dstate dimension in C.
+        D_stride: Stride for dim dimension in D.
+        z_b_stride: Stride for batch dimension in z.
+        z_d_stride: Stride for dim dimension in z.
+        dt_bias_stride: Stride for dim dimension in dt_bias.
     """
     # Calculate which (batch, dim) this thread is responsible for
     var thread_id = block_dim.x * block_idx.x + thread_idx.x
@@ -1163,6 +1415,139 @@ fn selective_scan_fwd_cpu[
                     chunk_idx += 1
                     t_in_chunk = 0
             t += 1
+
+    sync_parallelize[worker](batch * dim)
+
+
+# ===----------------------------------------------------------------------=== #
+# Minimal CPU kernel - no D, z, or delta_bias
+# ===----------------------------------------------------------------------=== #
+
+fn selective_scan_fwd_cpu_minimal[
+    kernel_dtype: DType,
+    output_layout: Layout,
+    x_layout: Layout,
+    u_layout: Layout,
+    delta_layout: Layout,
+    A_layout: Layout,
+    B_layout: Layout,
+    C_layout: Layout,
+](
+    batch: Int,
+    dim: Int,
+    seqlen: Int,
+    dstate: Int,
+    group_size: Int,
+    delta_softplus: Int8,
+    output: LayoutTensor[kernel_dtype, output_layout, MutAnyOrigin],
+    x: LayoutTensor[kernel_dtype, x_layout, MutAnyOrigin],
+    u: LayoutTensor[kernel_dtype, u_layout, MutAnyOrigin],
+    delta: LayoutTensor[kernel_dtype, delta_layout, MutAnyOrigin],
+    A: LayoutTensor[kernel_dtype, A_layout, MutAnyOrigin],
+    B: LayoutTensor[kernel_dtype, B_layout, MutAnyOrigin],
+    C: LayoutTensor[kernel_dtype, C_layout, MutAnyOrigin],
+    # Strides
+    output_b_stride: UInt32,
+    output_d_stride: UInt32,
+    output_t_stride: UInt32,
+    x_b_stride: UInt32,
+    x_d_stride: UInt32,
+    x_chunk_stride: UInt32,
+    x_n_stride: UInt32,
+    u_b_stride: UInt32,
+    u_d_stride: UInt32,
+    u_t_stride: UInt32,
+    delta_b_stride: UInt32,
+    delta_d_stride: UInt32,
+    delta_t_stride: UInt32,
+    A_d_stride: UInt32,
+    A_n_stride: UInt32,
+    B_b_stride: UInt32,
+    B_g_stride: UInt32,
+    B_n_stride: UInt32,
+    B_t_stride: UInt32,
+    C_b_stride: UInt32,
+    C_g_stride: UInt32,
+    C_n_stride: UInt32,
+    C_t_stride: UInt32,
+):
+    """Minimal CPU kernel for selective scan - no optional D, z, or delta_bias."""
+    
+    @parameter
+    fn worker(idx: Int):
+        var b = idx // dim
+        var d = idx % dim
+        
+        if b >= batch or d >= dim:
+            return
+        
+        var group_id = d // group_size
+        
+        var state = SIMD[DType.float32, MAX_DSTATE](0.0)
+        var cum_a = SIMD[DType.float32, MAX_DSTATE](1.0)
+        var cum_b = SIMD[DType.float32, MAX_DSTATE](0.0)
+        
+        var A_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+        var delta_softplus_bool = Bool(Int(delta_softplus) != 0)
+        
+        for n in range(dstate):
+            var A_offset = UInt32(d * Int(A_d_stride)) + UInt32(n * Int(A_n_stride))
+            A_vals[n] = Scalar[kernel_dtype](A.ptr.offset(A_offset).load()).cast[DType.float32]() * LOG2E
+
+        var chunk_size = 2048
+        var t_in_chunk = 0
+        var chunk_idx = 0
+        
+        var curr_u_offset = UInt32(b * Int(u_b_stride) + d * Int(u_d_stride))
+        var curr_delta_offset = UInt32(b * Int(delta_b_stride) + d * Int(delta_d_stride))
+        var curr_output_offset = UInt32(b * Int(output_b_stride) + d * Int(output_d_stride))
+        var curr_B_offset = UInt32(b * Int(B_b_stride) + group_id * Int(B_g_stride))
+        var curr_C_offset = UInt32(b * Int(C_b_stride) + group_id * Int(C_g_stride))
+        
+        for t in range(seqlen):
+            t_in_chunk += 1
+            
+            var u_val = Scalar[kernel_dtype](u.ptr.offset(curr_u_offset).load()).cast[DType.float32]()
+            var delta_val = Scalar[kernel_dtype](delta.ptr.offset(curr_delta_offset).load()).cast[DType.float32]()
+            if delta_softplus_bool:
+                delta_val = softplus(delta_val)
+            var delta_u = delta_val * u_val
+            
+            var B_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+            var C_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+            for n in range(dstate):
+                B_vals[n] = Scalar[kernel_dtype](B.ptr.offset(curr_B_offset + UInt32(n * Int(B_n_stride))).load()).cast[DType.float32]()
+                C_vals[n] = Scalar[kernel_dtype](C.ptr.offset(curr_C_offset + UInt32(n * Int(C_n_stride))).load()).cast[DType.float32]()
+            
+            var a_t = exp2(A_vals * delta_val)
+            var b_t = B_vals * delta_u
+            state = state * a_t + b_t
+            var output_val = (state * C_vals).reduce_add()
+            cum_b = cum_b * a_t + b_t
+            cum_a = cum_a * a_t
+            # No D skip connection
+            output.ptr.offset(curr_output_offset).store(Scalar[kernel_dtype](output_val.cast[kernel_dtype]()))
+            # No z gating
+            
+            curr_u_offset += u_t_stride
+            curr_delta_offset += delta_t_stride
+            curr_output_offset += output_t_stride
+            curr_B_offset += B_t_stride
+            curr_C_offset += C_t_stride
+            
+            var is_chunk_boundary = (t_in_chunk == chunk_size)
+            var is_last_step = (t == seqlen - 1)
+            if is_chunk_boundary or is_last_step:
+                for n in range(dstate):
+                    var x_offset_a = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2) * Int(x_n_stride))
+                    var x_offset_b = UInt32(b * Int(x_b_stride) + d * Int(x_d_stride) + chunk_idx * Int(x_chunk_stride) + (n * 2 + 1) * Int(x_n_stride))
+                    x.ptr.offset(x_offset_a).store(Scalar[kernel_dtype](cum_a[n].cast[kernel_dtype]()))
+                    x.ptr.offset(x_offset_b).store(Scalar[kernel_dtype](cum_b[n].cast[kernel_dtype]()))
+                    cum_a[n] = 1.0
+                    cum_b[n] = 0.0
+                if is_chunk_boundary:
+                    chunk_idx += 1
+                    t_in_chunk = 0
 
     sync_parallelize[worker](batch * dim)
 

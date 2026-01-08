@@ -960,7 +960,10 @@ def causal_conv1d_fn(
         },
     )
 
-    return result[0].tensor
+    # Ensure output tensor has a contiguous memory layout for compatibility
+    # with GPU kernels that may have strict layout requirements
+    output_tensor = result[0].tensor
+    return ops.reshape(output_tensor, output_tensor.shape)
 
 
 def causal_conv1d_update_fn(
@@ -1029,4 +1032,7 @@ def causal_conv1d_update_fn(
         },
     )
 
-    return result[0].tensor
+    # Ensure output tensor has a contiguous memory layout for compatibility
+    # with GPU kernels that may have strict layout requirements
+    output_tensor = result[0].tensor
+    return ops.reshape(output_tensor, output_tensor.shape)

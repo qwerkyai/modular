@@ -2132,6 +2132,147 @@ fn rms_norm_fused_residual_add[
 # rms_norm_fused_residual: Single RMSNorm with fused residual connection
 # ===----------------------------------------------------------------------=== #
 
+# Core 2D implementation that uses simple (row, col) indices to avoid
+# compile-time evaluation issues with IndexList[rank] lambda functions.
+fn _rms_norm_fused_residual_cpu_2d[
+    dtype: DType,
+    //,
+    input_fn: fn[width: Int] (Int, Int) capturing -> SIMD[dtype, width],
+    residual_input_fn: fn[width: Int] (Int, Int) capturing -> SIMD[dtype, width],
+    output_fn: fn[width: Int, alignment: Int] (
+        Int, Int, SIMD[dtype, width]
+    ) capturing -> None,
+    output_residual_fn: fn[width: Int, alignment: Int] (
+        Int, Int, SIMD[dtype, width]
+    ) capturing -> None,
+    multiply_before_cast: Bool = True,
+](
+    gamma: LayoutTensor[dtype, **_],
+    epsilon: Scalar[dtype],
+    weight_offset: Scalar[dtype],
+    out_shape: IndexList[2],
+    dropout_p: Scalar[dtype] = Scalar[dtype](0.0),
+    seed: UInt64 = 0,
+):
+    """Core 2D implementation of RMSNorm with fused residual.
+    
+    Uses simple (row, col) indexing to avoid compile-time evaluation issues.
+    """
+    __comptime_assert gamma.rank == 1, "gamma must have rank 1"
+
+    var num_rows = out_shape[0]
+    var num_cols = out_shape[1]
+
+    comptime simd_width = simd_width_of[dtype]()
+    var simd_loop_end = align_down(num_cols, simd_width)
+    comptime intermediate_type = get_accum_type[dtype]()
+
+    # Calculate dropout scale if needed
+    var dropout_scale = Scalar[dtype](1.0)
+    var zero_scalar = Scalar[dtype](0.0)
+    if dropout_p > zero_scalar:
+        var one_scalar = Scalar[dtype](1.0)
+        dropout_scale = one_scalar / (one_scalar - dropout_p)
+
+    for row in range(num_rows):
+        # First compute sum of squared (input + residual) for RMSNorm
+        var sum_simd = SIMD[intermediate_type, simd_width]()
+        
+        # SIMD loop
+        for col in range(0, simd_loop_end, simd_width):
+            var input_vals = input_fn[simd_width](row, col)
+            var residual_vals = residual_input_fn[simd_width](row, col)
+            
+            # Apply dropout if enabled
+            if dropout_p > zero_scalar:
+                @parameter
+                for i in range(simd_width):
+                    var element_offset = row * num_cols + col + i
+                    var generator = Random(seed=seed, offset=UInt64(element_offset))
+                    var rng = generator.step_uniform()
+                    var rng_val = rng[0].cast[dtype]()
+                    if rng_val >= dropout_p:
+                        input_vals[i] = input_vals[i] * dropout_scale
+                    else:
+                        input_vals[i] = zero_scalar
+            
+            var sum_vals = input_vals + residual_vals
+            
+            # Output pre-normalized value (x + residual)
+            output_residual_fn[simd_width, 1](row, col, sum_vals)
+            
+            # Accumulate for RMSNorm
+            sum_simd += sum_vals.cast[intermediate_type]() ** 2
+        
+        # Scalar loop for remainder
+        var sum_val = sum_simd.reduce_add()
+        for col in range(simd_loop_end, num_cols):
+            var input_val = input_fn[1](row, col)[0]
+            var residual_val = residual_input_fn[1](row, col)[0]
+            
+            # Apply dropout if enabled
+            if dropout_p > zero_scalar:
+                var element_offset = row * num_cols + col
+                var generator = Random(seed=seed, offset=UInt64(element_offset))
+                var rng = generator.step_uniform()
+                var rng_val = rng[0].cast[dtype]()
+                if rng_val >= dropout_p:
+                    input_val = input_val * dropout_scale
+                else:
+                    input_val = zero_scalar
+            
+            var sum_val_scalar = input_val + residual_val
+            
+            # Output pre-normalized value
+            output_residual_fn[1, 1](row, col, sum_val_scalar)
+            
+            # Accumulate for RMSNorm
+            sum_val += sum_val_scalar.cast[intermediate_type]() ** 2
+        
+        # Compute normalization factor
+        var mean_val = _sum_to_mean(sum_val, num_cols)
+        var norm_factor = rsqrt(mean_val + epsilon.cast[intermediate_type]())
+        
+        # Second pass: apply normalization
+        fn _normalize[sw: Int](col: Int) unified {mut}:
+            # Re-read the pre-normalized values (input + residual)
+            var input_vals = input_fn[sw](row, col)
+            var residual_vals = residual_input_fn[sw](row, col)
+            
+            # Apply dropout again (same pattern to get same result)
+            if dropout_p > zero_scalar:
+                @parameter
+                for i in range(sw):
+                    var element_offset = row * num_cols + col + i
+                    var generator = Random(seed=seed, offset=UInt64(element_offset))
+                    var rng = generator.step_uniform()
+                    var rng_val = rng[0].cast[dtype]()
+                    if rng_val >= dropout_p:
+                        input_vals[i] = input_vals[i] * dropout_scale
+                    else:
+                        input_vals[i] = zero_scalar
+            
+            var sum_vals = (input_vals + residual_vals).cast[intermediate_type]()
+            
+            var gamma_col = gamma.runtime_layout(
+                RuntimeTuple[IntTuple(UNKNOWN_VALUE)](col)
+            )
+            var gamma_val = gamma.ptr.load[width=sw](gamma_col)
+            var norm_val: SIMD[dtype, sw]
+            
+            if multiply_before_cast:
+                var gamma_offset = gamma_val + weight_offset
+                norm_val = (sum_vals * norm_factor).cast[dtype]() * gamma_offset
+            else:
+                norm_val = (sum_vals * norm_factor).cast[dtype]() * (
+                    gamma_val + weight_offset
+                )
+            
+            output_fn[sw, 1](row, col, norm_val)
+        
+        vectorize[simd_width](num_cols, _normalize)
+
+
 fn rms_norm_fused_residual_cpu[
     dtype: DType,
     rank: Int,
@@ -2158,105 +2299,64 @@ fn rms_norm_fused_residual_cpu[
     dropout_p: Scalar[dtype] = Scalar[dtype](0.0),
     seed: UInt64 = 0,
 ) raises:
+    """Generic rank wrapper that delegates to the 2D core implementation.
+    
+    Creates 2D wrapper lambdas that translate (row, col) to IndexList[rank]
+    at runtime, avoiding compile-time evaluation issues with _lambda_load.
+    """
     __comptime_assert gamma.rank == 1, "gamma must have rank 1"
 
-    # Create intermediate buffer to store x + residual
-    var intermediate_buffer_ptr = UnsafePointer[Scalar[dtype]].alloc(
-        shape.flattened_length()
-    )
-    var intermediate_buffer = LayoutTensor[dtype, Layout.row_major[rank]()](
-        intermediate_buffer_ptr,
-        RuntimeLayout[Layout.row_major[rank]()].row_major(shape),
-    )
-
-    # First pass: add residual to input and store in intermediate buffer
-    @parameter
-    @always_inline
-    @__copy_capture(intermediate_buffer)
-    fn intermediate_output_fn[
-        width: Int, alignment: Int
-    ](idx: IndexList[rank], val: SIMD[dtype, width]) -> None:
-        # val already contains (input + residual) from the calling loop
-        # Output the pre-normalized value (x + residual) for prenorm mode
-        output_residual_fn[width, alignment](idx, val)
-        
-        # Store in intermediate buffer for RMSNorm
-        var intermediate_idx = intermediate_buffer.runtime_layout(
-            RuntimeTuple[
-                fill_like(intermediate_buffer.layout.shape, UNKNOWN_VALUE)
-            ](idx)
-        )
-        intermediate_buffer.ptr.store[width=width, alignment=alignment](
-            intermediate_idx, val
-        )
-
-    # Manually iterate through all elements to add residual to input
-    # This is simpler than trying to use rms_norm_cpu with identity parameters
     var last_dim = shape[rank - 1]
     var prod_all_but_last_dim = shape.flattened_length() // last_dim
-    comptime simd_width = simd_width_of[dtype]()
-    
-    # Calculate dropout scale if needed
-    var dropout_scale = Scalar[dtype](1.0)
-    var zero_scalar = Scalar[dtype](0.0)
-    if dropout_p > zero_scalar:
-        var one_scalar = Scalar[dtype](1.0)
-        dropout_scale = one_scalar / (one_scalar - dropout_p)
-    
-    for row in range(prod_all_but_last_dim):
-        for col in range(0, last_dim, simd_width):
-            var indices = _get_start_indices_of_nth_subvolume(row, shape)
-            var input_vals = SIMD[dtype, simd_width](0)
-            var residual_vals = SIMD[dtype, simd_width](0)
-            
-            for i in range(simd_width):
-                if col + i < last_dim:
-                    indices[rank - 1] = col + i
-                    var input_val = input_fn[1](indices.canonicalize())[0]
-                    
-                    # Apply dropout if enabled
-                    if dropout_p > zero_scalar:
-                        # Use element position as offset for RNG to ensure different values per element
-                        var element_offset = row * last_dim + col + i
-                        var generator = Random(seed=seed, offset=UInt64(element_offset))
-                        var rng = generator.step_uniform()
-                        var rng_val = rng[0].cast[dtype]()
-                        if rng_val >= dropout_p:
-                            input_val = input_val * dropout_scale
-                        else:
-                            input_val = zero_scalar
-                    
-                    input_vals[i] = input_val
-                    residual_vals[i] = residual_input_fn[1](indices.canonicalize())[0]
-            
-            var sum_vals = input_vals + residual_vals
-            
-            for i in range(simd_width):
-                if col + i < last_dim:
-                    indices[rank - 1] = col + i
-                    intermediate_output_fn[1, 1](indices.canonicalize(), sum_vals[i])
 
-    # Second pass: apply RMSNorm to the intermediate buffer
+    # Create 2D wrapper lambdas that translate indices at runtime
     @parameter
     @always_inline
-    @__copy_capture(intermediate_buffer)
-    fn intermediate_input_fn[
-        width: Int, rank_: Int
-    ](idx: IndexList[rank_]) -> SIMD[dtype, width]:
-        var intermediate_idx = intermediate_buffer.runtime_layout(
-            RuntimeTuple[
-                fill_like(intermediate_buffer.layout.shape, UNKNOWN_VALUE)
-            ](idx)
-        )
-        return intermediate_buffer.ptr.load[width=width](intermediate_idx)
+    fn input_fn_2d[simd_width: Int](row: Int, col: Int) -> SIMD[dtype, simd_width]:
+        var indices = _get_start_indices_of_nth_subvolume(row, shape)
+        indices[rank - 1] = col
+        return input_fn[simd_width, rank](indices)
 
-    rms_norm_cpu[
-        intermediate_input_fn,
-        output_fn,
+    @parameter
+    @always_inline
+    fn residual_input_fn_2d[simd_width: Int](row: Int, col: Int) -> SIMD[dtype, simd_width]:
+        var indices = _get_start_indices_of_nth_subvolume(row, shape)
+        indices[rank - 1] = col
+        return residual_input_fn[simd_width, rank](indices)
+
+    @parameter
+    @always_inline
+    fn output_fn_2d[
+        simd_width: Int, alignment: Int
+    ](row: Int, col: Int, val: SIMD[dtype, simd_width]) -> None:
+        var indices = _get_start_indices_of_nth_subvolume(row, shape)
+        indices[rank - 1] = col
+        output_fn[simd_width, alignment](indices, val)
+
+    @parameter
+    @always_inline
+    fn output_residual_fn_2d[
+        simd_width: Int, alignment: Int
+    ](row: Int, col: Int, val: SIMD[dtype, simd_width]) -> None:
+        var indices = _get_start_indices_of_nth_subvolume(row, shape)
+        indices[rank - 1] = col
+        output_residual_fn[simd_width, alignment](indices, val)
+
+    # Call the 2D core implementation
+    _rms_norm_fused_residual_cpu_2d[
+        input_fn_2d,
+        residual_input_fn_2d,
+        output_fn_2d,
+        output_residual_fn_2d,
         multiply_before_cast=multiply_before_cast,
-    ](shape, gamma, epsilon, weight_offset)
-
-    intermediate_buffer_ptr.free()
+    ](
+        gamma,
+        epsilon,
+        weight_offset,
+        out_shape=IndexList[2](prod_all_but_last_dim, last_dim),
+        dropout_p=dropout_p,
+        seed=seed,
+    )
 
 
 fn rms_norm_fused_residual_gpu_block[

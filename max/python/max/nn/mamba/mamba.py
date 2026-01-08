@@ -26,8 +26,7 @@ from max.graph import DeviceRef, Dim, TensorType, TensorValue, Weight, ops
 from max.nn import Layer, Linear, Module
 from max.nn.conv import causal_conv1d_fn, causal_conv1d_update_fn
 from max.nn.norm import layer_norm_fn
-from max.nn.norm.layer_norm import LayerNorm
-from max.nn.norm.rms_norm import RMSNorm
+from max.nn.selective_scan import mamba_inner_fn
 
 
 class MambaSSM(Module):
@@ -152,63 +151,27 @@ class MambaSSM(Module):
             )
         
         # State space parameter projections
-        # x_proj: projects conv output to (B, C, delta) parameters
-        # B and C have shape (batch, n_groups, dstate, seqlen)
-        # delta has shape (batch, intermediate_size, seqlen)
-        # We use n_groups = intermediate_size // d_state for grouping
-        self.n_groups = intermediate_size // d_state
+        # x_proj: projects conv output to (dt_rank, B, C) parameters
+        # Reference: self.x_proj = nn.Linear(d_inner, dt_rank + d_state * 2)
+        # B and C each have d_state elements, not grouped (n_groups=1 in standard Mamba)
+        # 
+        # Note: Some Mamba variants use n_groups > 1 for grouped B/C projections,
+        # but standard Mamba (mamba_simple.py) uses n_groups=1.
+        self.n_groups = 1  # Standard Mamba uses n_groups=1
         
-        # x_proj_dim can be provided directly (inferred from weights) or calculated
-        # If not provided, calculate: dt_rank + 2 * n_groups * d_state
+        # x_proj_dim = dt_rank + d_state * 2 (for B and C, each of size d_state)
+        # If x_proj_dim is provided from weights, use it and infer dt_rank
         if x_proj_dim is not None:
-            # Use provided x_proj_dim (inferred from actual weight shape)
-            # Recalculate dt_rank to match the actual x_proj_dim
-            # Formula: x_proj_dim = dt_rank + 2 * n_groups * d_state
-            # So: dt_rank = x_proj_dim - 2 * n_groups * d_state
-            bc_dim = 2 * self.n_groups * d_state
-            calculated_dt_rank = x_proj_dim - bc_dim
+            # Infer dt_rank from provided x_proj_dim
+            # x_proj_dim = dt_rank + 2 * d_state
+            # So: dt_rank = x_proj_dim - 2 * d_state
+            calculated_dt_rank = x_proj_dim - 2 * d_state
             if calculated_dt_rank > 0:
-                # Normal case: x_proj_dim matches expected formula
                 self.dt_rank = calculated_dt_rank
-                self.bc_dim = bc_dim
-            else:
-                # x_proj_dim doesn't match expected formula
-                # This can happen if the model architecture is different
-                # For some models, x_proj might project to intermediate_size directly
-                # In that case, we need to recalculate n_groups based on x_proj_dim
-                # Try: if x_proj_dim == intermediate_size, then maybe it's a different architecture
-                if x_proj_dim == intermediate_size:
-                    # Special case: x_proj projects to intermediate_size
-                    # This might mean dt_rank = intermediate_size and no BC projection
-                    # But that doesn't match standard Mamba architecture
-                    # For now, use a heuristic: assume dt_rank is a reasonable fraction
-                    self.dt_rank = max(16, min(x_proj_dim // 4, hidden_size // 16))
-                    self.bc_dim = x_proj_dim - self.dt_rank
-                    # Recalculate n_groups to match bc_dim
-                    if self.bc_dim > 0 and d_state > 0:
-                        # bc_dim = 2 * n_groups * d_state, so n_groups = bc_dim / (2 * d_state)
-                        self.n_groups = self.bc_dim // (2 * d_state)
-                        if self.n_groups == 0:
-                            self.n_groups = 1
-                else:
-                    # Use minimum dt_rank and rest for BC
-                    min_dt_rank = max(16, hidden_size // 16)
-                    if x_proj_dim > min_dt_rank:
-                        self.dt_rank = min_dt_rank
-                        self.bc_dim = x_proj_dim - min_dt_rank
-                        # Recalculate n_groups to match bc_dim
-                        if self.bc_dim > 0 and d_state > 0:
-                            self.n_groups = self.bc_dim // (2 * d_state)
-                            if self.n_groups == 0:
-                                self.n_groups = 1
-                    else:
-                        # x_proj_dim is too small, use it all for dt_rank
-                        self.dt_rank = x_proj_dim
-                        self.bc_dim = 0
-                        self.n_groups = 1  # Minimum to avoid division by zero
+            # else keep dt_rank from "auto" calculation above
         else:
-            x_proj_dim = self.dt_rank + 2 * self.n_groups * d_state  # dt_rank + B + C
-            self.bc_dim = 2 * self.n_groups * d_state
+            # Calculate x_proj_dim from dt_rank and d_state
+            x_proj_dim = self.dt_rank + 2 * d_state
         
         self.x_proj = linear_cls(
             in_dim=intermediate_size,
@@ -267,7 +230,8 @@ class MambaSSM(Module):
         
         # State buffers for autoregressive generation
         # These will be initialized on first use
-        self._conv_state: Weight | None = None  # (batch, intermediate_size, width-1)
+        # Reference shapes: conv_state (batch, d_inner, d_conv), ssm_state (batch, d_inner, d_state)
+        self._conv_state: Weight | None = None  # (batch, intermediate_size, d_conv)
         self._ssm_state: Weight | None = None  # (batch, intermediate_size, d_state)
 
     def __call__(
@@ -293,6 +257,8 @@ class MambaSSM(Module):
         use_step = False
         if inference_params is not None and self.layer_idx is not None:
             seqlen_offset = inference_params.get("seqlen_offset", 0)
+        else:
+            seqlen_offset = 0
 
             def _is_one(dim: Dim | int) -> bool:
                 try:
@@ -352,152 +318,189 @@ class MambaSSM(Module):
             return ss_output
         
         # Step 2: Input projection and gating (for prefill mode)
-        # Project input - matches reference: "We do matmul and transpose BLH -> HBL at the same time"
-        # In MAX, we work with flattened tensors, so we just do the projection
-        xz = self.in_proj(x)  # (batch * seqlen, intermediate_size * 2)
-        
-        # Split into x and z (gate and up in reference terminology)
-        # Reference splits as: x, z = xz.chunk(2, dim=1)
-        x, z = ops.split(
-            xz,
-            [self.intermediate_size, self.intermediate_size],
-            axis=-1,
-        )
-        
-        # Step 3: Infer batch and seqlen for reshaping
+        # Infer batch and seqlen for reshaping
         # For now, simplify and use batch_size=1 to avoid ragged tensor complexity
         # TODO: Implement proper ragged tensor support
-        # Force graph rebuild: updated 2025-01-04
         batch_size = 1
         seqlen = x.shape[0]
-
-        x_conv_input = ops.reshape(
-            x,
-            shape=[batch_size, self.intermediate_size, seqlen],
-        )
-
-        z_conv = ops.reshape(
-            z,
-            shape=[batch_size, self.intermediate_size, seqlen],
-        )
-
-        # Step 4: Prefill selective scan (full sequence)
-        # Apply conv1d to x
-        x_conv = causal_conv1d_fn(
-            x_conv_input,
-            self.conv1d_weight,
-            bias=self.conv1d_bias,
-            algorithm="optimized",
-            activation="silu",
-        )  # (batch, intermediate_size, seqlen)
-
-        # Reshape back to flattened format for projections
-        x_flat = ops.reshape(
-            x_conv,
-            shape=[batch_size * seqlen, self.intermediate_size],
-        )
-
-        # Step 5: Project to get B, C, delta
-        x_proj = self.x_proj(x_flat)  # (batch * seqlen, dt_rank + 2 * n_groups * d_state)
-
-        # Split x_proj into delta, B, C
-        bc_dim = getattr(self, 'bc_dim', 2 * self.n_groups * self.d_state)
-        dt, BC = ops.split(
-            x_proj,
-            [self.dt_rank, bc_dim],
-            axis=-1,
-        )
-
-        # Project delta
-        dt_proj = self.dt_proj(dt)  # (batch * seqlen, intermediate_size)
-
-        # Split BC into B and C
-        B, C = ops.split(
-            BC,
-            [self.n_groups * self.d_state, self.n_groups * self.d_state],
-            axis=-1,
-        )
-
-        # Step 6: Reshape for selective scan forward
-        u = ops.reshape(x_flat, shape=[batch_size, self.intermediate_size, seqlen])
-        delta = ops.reshape(dt_proj, shape=[batch_size, self.intermediate_size, seqlen])
-        B_reshaped = ops.reshape(
-            B,
-            shape=[batch_size, self.n_groups, self.d_state, seqlen],
-        )
-        C_reshaped = ops.reshape(
-            C,
-            shape=[batch_size, self.n_groups, self.d_state, seqlen],
-        )
-
-        # Prepare A and D
-        A_log_cast = self.A_log.cast(self.dtype)
-        A = ops.negate(ops.exp(A_log_cast))  # (intermediate_size, d_state)
-        D = self.D.cast(self.dtype)
-
-        # delta_bias
-        if hasattr(self.dt_proj, 'bias') and self.dt_proj.bias is not None:
-            delta_bias = self.dt_proj.bias.cast(self.dtype)
-        else:
-            delta_bias = ops.constant(0.0, dtype=self.dtype, device=x.device)
-            delta_bias = ops.broadcast_to(delta_bias, shape=[self.intermediate_size])
-
-        # selective_scan_fwd outputs
-        chunk_size = 2048
-        num_chunks = (seqlen + Dim(chunk_size) - Dim(1)) // Dim(chunk_size)
-
-        output_type = TensorType(
-            dtype=self.dtype,
-            shape=[batch_size, self.intermediate_size, seqlen],
-            device=x.device,
-        )
-        x_checkpoint_type = TensorType(
-            dtype=self.dtype,
-            shape=[batch_size, self.intermediate_size, num_chunks, 2 * self.d_state],
-            device=x.device,
-        )
-        out_z_type = TensorType(
-            dtype=self.dtype,
-            shape=[batch_size, self.intermediate_size, seqlen],
-            device=x.device,
-        )
-
-        results = ops.custom(
-            "selective_scan_fwd",
-            device=x.device,
-            values=[u, delta, A, B_reshaped, C_reshaped, D, z_conv, delta_bias],
-            out_types=[output_type, x_checkpoint_type, out_z_type],
-            parameters={"delta_softplus": self.delta_softplus},
-        )
-
-        ss_output = results[0].tensor  # (batch, intermediate_size, seqlen)
-
-        # Flatten and project out
-        ss_output_flat = ops.reshape(
-            ss_output,
-            shape=[batch_size * seqlen, self.intermediate_size],
-        )
-        return self.out_proj(ss_output_flat)
-
-        # Step 10: Reshape back to flattened format
-        # (batch, intermediate_size, seqlen) -> (batch * seqlen, intermediate_size)
-        # With batch_size=1, this is just (seqlen, intermediate_size)
-        ss_output_flat = ops.reshape(
-            ss_output,
-            shape=[batch_size * seqlen, self.intermediate_size],
-        )
-
-        # Step 11: Output projection
-        # Project back to hidden_size
-        return self.out_proj(ss_output_flat)
-        ss_output = ops.reshape(
-            ss_output,
-            shape=[batch_size * seqlen, self.intermediate_size],
+        
+        # Project input - matches reference: "We do matmul and transpose BLH -> HBL at the same time"
+        # Reference does: rearrange(self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"), "d (b l) -> b d l", l=seqlen)
+        # In MAX, we work with flattened tensors, so we project then reshape
+        xz_flat = self.in_proj(x)  # (batch * seqlen, intermediate_size * 2)
+        
+        # Reshape to (batch, 2 * intermediate_size, seqlen) for mamba_inner_fn
+        # This matches the reference format: (batch, dim, seqlen)
+        xz = ops.reshape(
+            xz_flat,
+            shape=[batch_size, self.intermediate_size * 2, seqlen],
         )
         
-        # Step 11: Output projection
-        # Project back to hidden_size
-        return self.out_proj(ss_output)
+        # Check if we should use fast path (mamba_inner_fn)
+        # Reference: use_fast_path and causal_conv1d_fn is not None and inference_params is None
+        use_fast_path = (
+            self.use_fast_path
+            and causal_conv1d_fn is not None
+            and inference_params is None
+        )
+        
+        if use_fast_path:
+            # Fast path: use mamba_inner_fn
+            # Prepare A and D
+            A_log_cast = self.A_log.cast(self.dtype)
+            A = ops.negate(ops.exp(A_log_cast))  # (intermediate_size, d_state)
+            D = self.D.cast(self.dtype)
+            
+            # Get delta_bias
+            if hasattr(self.dt_proj, 'bias') and self.dt_proj.bias is not None:
+                delta_bias = self.dt_proj.bias.cast(self.dtype)
+            else:
+                delta_bias = None
+            
+            # Call mamba_inner_fn
+            # xz: (batch, 2 * intermediate_size, seqlen)
+            # Returns: (batch, seqlen, hidden_size)
+            out = mamba_inner_fn(
+                xz=xz,
+                conv1d_weight=self.conv1d_weight,
+                conv1d_bias=self.conv1d_bias,
+                x_proj_weight=self.x_proj.weight,
+                delta_proj_weight=self.dt_proj.weight,
+                out_proj_weight=self.out_proj.weight,
+                out_proj_bias=self.out_proj.bias if hasattr(self.out_proj, 'bias') and self.out_proj.bias is not None else None,
+                A=A,
+                B=None,  # Will be computed from x_proj output
+                C=None,  # Will be computed from x_proj output
+                D=D,
+                delta_bias=delta_bias,
+                delta_softplus=self.delta_softplus,
+            )
+            
+            # Reshape output back to flattened format: (batch, seqlen, hidden_size) -> (batch * seqlen, hidden_size)
+            out_flat = ops.reshape(
+                out,
+                shape=[batch_size * seqlen, self.hidden_size],
+            )
+            return out_flat
+        else:
+            # Slow path: manual computation (matches reference else branch)
+            # Split into x and z (gate and up in reference terminology)
+            x, z = ops.split(
+                xz,
+                [self.intermediate_size, self.intermediate_size],
+                axis=1,
+            )
+
+            x_conv_input = x  # Already in (batch, intermediate_size, seqlen)
+            z_conv = z  # Already in (batch, intermediate_size, seqlen)
+
+            # Apply conv1d to x
+            x_conv = causal_conv1d_fn(
+                x_conv_input,
+                self.conv1d_weight,
+                bias=self.conv1d_bias,
+                algorithm="optimized",
+                activation="silu",
+            )  # (batch, intermediate_size, seqlen)
+
+            # Permute and reshape for linear projections
+            # (batch, intermediate_size, seqlen) -> (batch, seqlen, intermediate_size) -> (batch * seqlen, intermediate_size)
+            x_conv_permuted = ops.permute(x_conv, [0, 2, 1])  # (batch, seqlen, intermediate_size)
+            x_flat = ops.reshape(
+                x_conv_permuted,
+                shape=[batch_size * seqlen, self.intermediate_size],
+            )
+
+            # Project to get B, C, delta
+            # Reference: x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
+            x_proj = self.x_proj(x_flat)  # (batch * seqlen, dt_rank + 2 * d_state)
+
+            # Split x_proj into delta, B, C
+            # Reference: dt, B, C = torch.split(x_dbl, [dt_rank, d_state, d_state], dim=-1)
+            dt, B, C = ops.split(
+                x_proj,
+                [self.dt_rank, self.d_state, self.d_state],
+                axis=-1,
+            )
+
+            # Project delta
+            # Reference: dt = self.dt_proj.weight @ dt.t()
+            dt_proj = self.dt_proj(dt)  # (batch * seqlen, intermediate_size)
+
+            # Reshape for selective scan forward
+            # Reference: dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
+            # (batch * seqlen, intermediate_size) -> (batch, seqlen, intermediate_size) -> (batch, intermediate_size, seqlen)
+            dt_reshaped = ops.reshape(dt_proj, shape=[batch_size, seqlen, self.intermediate_size])
+            delta = ops.permute(dt_reshaped, [0, 2, 1])  # (batch, intermediate_size, seqlen)
+            
+            # u is the conv output in (batch, intermediate_size, seqlen) format
+            u = x_conv  # Already in correct shape
+            
+            # Reshape B and C: (batch * seqlen, d_state) -> (batch, 1, d_state, seqlen)
+            # Reference: B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen)
+            # For selective_scan_fn: B should be (batch, n_groups, d_state, seqlen) with n_groups=1
+            # Step 1: (batch * seqlen, d_state) -> (batch, seqlen, d_state)
+            B_temp = ops.reshape(B, shape=[batch_size, seqlen, self.d_state])
+            # Step 2: (batch, seqlen, d_state) -> (batch, d_state, seqlen)
+            B_temp = ops.permute(B_temp, [0, 2, 1])
+            # Step 3: Add n_groups dimension: (batch, d_state, seqlen) -> (batch, 1, d_state, seqlen)
+            B_reshaped = ops.reshape(B_temp, shape=[batch_size, 1, self.d_state, seqlen])
+            
+            # Same for C
+            C_temp = ops.reshape(C, shape=[batch_size, seqlen, self.d_state])
+            C_temp = ops.permute(C_temp, [0, 2, 1])
+            C_reshaped = ops.reshape(C_temp, shape=[batch_size, 1, self.d_state, seqlen])
+
+            # Prepare A and D
+            A_log_cast = self.A_log.cast(self.dtype)
+            A = ops.negate(ops.exp(A_log_cast))  # (intermediate_size, d_state)
+            D = self.D.cast(self.dtype)
+
+            # delta_bias
+            if hasattr(self.dt_proj, 'bias') and self.dt_proj.bias is not None:
+                delta_bias = self.dt_proj.bias.cast(self.dtype)
+            else:
+                delta_bias = ops.constant(0.0, dtype=self.dtype, device=u.device)
+                delta_bias = ops.broadcast_to(delta_bias, shape=[self.intermediate_size])
+
+            # selective_scan_fwd outputs
+            chunk_size = 2048
+            num_chunks = (seqlen + Dim(chunk_size) - Dim(1)) // Dim(chunk_size)
+
+            output_type = TensorType(
+                dtype=self.dtype,
+                shape=[batch_size, self.intermediate_size, seqlen],
+                device=u.device,
+            )
+            x_checkpoint_type = TensorType(
+                dtype=self.dtype,
+                shape=[batch_size, self.intermediate_size, num_chunks, 2 * self.d_state],
+                device=u.device,
+            )
+            out_z_type = TensorType(
+                dtype=self.dtype,
+                shape=[batch_size, self.intermediate_size, seqlen],
+                device=u.device,
+            )
+
+            results = ops.custom(
+                "selective_scan_fwd",
+                device=u.device,
+                values=[u, delta, A, B_reshaped, C_reshaped, D, z_conv, delta_bias],
+                out_types=[output_type, x_checkpoint_type, out_z_type],
+                parameters={"delta_softplus": self.delta_softplus},
+            )
+
+            ss_output = results[0].tensor  # (batch, intermediate_size, seqlen)
+
+            # Permute to (batch, seqlen, intermediate_size) then flatten for output projection
+            # Reference: y = rearrange(y, "b d l -> b l d")
+            ss_output_permuted = ops.permute(ss_output, [0, 2, 1])  # (batch, seqlen, intermediate_size)
+            ss_output_flat = ops.reshape(
+                ss_output_permuted,
+                shape=[batch_size * seqlen, self.intermediate_size],
+            )
+            return self.out_proj(ss_output_flat)
     
     def step(
         self,
@@ -558,29 +561,25 @@ class MambaSSM(Module):
         x = ops.reshape(x_conv, shape=[batch_size, self.intermediate_size])
         
         # Project to get dt, B, C
+        # Reference: x_db = self.x_proj(x)  # (B, dt_rank + 2*d_state)
         x_db = self.x_proj(x)  # (batch, dt_rank + 2 * d_state)
         
         # Split into dt, B, C
-        bc_dim = getattr(self, 'bc_dim', 2 * self.n_groups * self.d_state)
-        dt, BC = ops.split(
+        # Reference: dt, B, C = torch.split(x_db, [dt_rank, d_state, d_state], dim=-1)
+        dt, B, C = ops.split(
             x_db,
-            [self.dt_rank, bc_dim],
+            [self.dt_rank, self.d_state, self.d_state],
             axis=-1,
         )
         
         # Project delta (don't add dt_bias here, kernel handles it)
+        # Reference: dt = F.linear(dt, self.dt_proj.weight)
         dt = self.dt_proj(dt)  # (batch, intermediate_size)
         
-        # Split BC into B and C
-        B, C = ops.split(
-            BC,
-            [self.n_groups * self.d_state, self.n_groups * self.d_state],
-            axis=-1,
-        )
-        
         # Reshape B and C for update kernel: (batch, n_groups, d_state)
-        B_grouped = ops.reshape(B, shape=[batch_size, self.n_groups, self.d_state])
-        C_grouped = ops.reshape(C, shape=[batch_size, self.n_groups, self.d_state])
+        # n_groups=1 for standard Mamba
+        B_grouped = ops.reshape(B, shape=[batch_size, 1, self.d_state])
+        C_grouped = ops.reshape(C, shape=[batch_size, 1, self.d_state])
         
         # Prepare A and D (same as forward)
         A_log_cast = self.A_log.cast(self.dtype)
@@ -637,6 +636,10 @@ class MambaSSM(Module):
         Matches reference implementation:
         https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba_simple.py
         
+        Reference shapes:
+        - conv_state: (batch_size, d_model * expand, d_conv)
+        - ssm_state: (batch_size, d_model * expand, d_state)
+        
         Args:
             batch_size: Batch size for the cache.
             max_seqlen: Maximum sequence length (not used for Mamba, but kept for compatibility).
@@ -649,7 +652,7 @@ class MambaSSM(Module):
         conv_state = ops.constant(0.0, dtype=conv_dtype, device=self.device)
         conv_state = ops.broadcast_to(
             conv_state,
-            shape=[batch_size, self.intermediate_size, self.conv_width - 1],
+            shape=[batch_size, self.intermediate_size, self.conv_width],
         )
         
         ssm_dtype = self.dt_proj.weight.dtype if dtype is None else dtype
@@ -759,14 +762,21 @@ class Block(Module):
             if layer_norm_fn is None:
                 raise ValueError("layer_norm_fn import fails")
             # Only LayerNorm and RMSNorm are supported for fused_add_norm
-            if self.norm is not None and not isinstance(self.norm, (LayerNorm, RMSNorm)):
+            # We use duck typing (attribute checks) since Protocol classes can't be used with isinstance
+            def _is_valid_norm(norm: Layer | None) -> bool:
+                if norm is None:
+                    return True
+                # Check for required attributes that all norm layers should have
+                return hasattr(norm, 'weight') and hasattr(norm, 'eps')
+            
+            if not _is_valid_norm(self.norm):
                 raise ValueError(
-                    "Only LayerNorm and RMSNorm are supported for fused_add_norm, "
+                    "Only LayerNorm and FusedRMSNorm are supported for fused_add_norm, "
                     f"got {type(self.norm)}"
                 )
-            if self.norm2 is not None and not isinstance(self.norm2, (LayerNorm, RMSNorm)):
+            if not _is_valid_norm(self.norm2):
                 raise ValueError(
-                    "Only LayerNorm and RMSNorm are supported for fused_add_norm, "
+                    "Only LayerNorm and FusedRMSNorm are supported for fused_add_norm, "
                     f"got {type(self.norm2)}"
                 )
 
@@ -816,9 +826,13 @@ class Block(Module):
                 if hidden_states.device:
                     norm_weight = norm_weight.to(hidden_states.device)
                 
+                # Check if this is an RMSNorm by class name (avoid isinstance due to Protocol issues)
+                norm_type_name = type(self.norm).__name__
+                is_rms_norm = 'RMSNorm' in norm_type_name
+                
                 # Get bias (can be None for RMSNorm)
                 norm_bias = None
-                if isinstance(self.norm, LayerNorm) and self.norm.bias is not None:
+                if not is_rms_norm and hasattr(self.norm, 'bias') and self.norm.bias is not None:
                     norm_bias = self.norm.bias.cast(hidden_states.dtype)
                     if hidden_states.device:
                         norm_bias = norm_bias.to(hidden_states.device)
@@ -831,7 +845,7 @@ class Block(Module):
                     prenorm=True,
                     residual_in_fp32=self.residual_in_fp32,
                     eps=self.norm.eps,
-                    is_rms_norm=isinstance(self.norm, RMSNorm),
+                    is_rms_norm=is_rms_norm,
                 )
             else:
                 # No norm, just use hidden_states as residual
@@ -876,9 +890,13 @@ class Block(Module):
                     if hidden_states.device:
                         norm2_weight = norm2_weight.to(hidden_states.device)
                     
+                    # Check if this is an RMSNorm by class name (avoid isinstance due to Protocol issues)
+                    norm2_type_name = type(self.norm2).__name__
+                    is_rms_norm2 = 'RMSNorm' in norm2_type_name
+                    
                     # Get bias (can be None for RMSNorm)
                     norm2_bias = None
-                    if isinstance(self.norm2, LayerNorm) and self.norm2.bias is not None:
+                    if not is_rms_norm2 and hasattr(self.norm2, 'bias') and self.norm2.bias is not None:
                         norm2_bias = self.norm2.bias.cast(hidden_states.dtype)
                         if hidden_states.device:
                             norm2_bias = norm2_bias.to(hidden_states.device)
@@ -891,7 +909,7 @@ class Block(Module):
                         prenorm=True,
                         residual_in_fp32=self.residual_in_fp32,
                         eps=self.norm2.eps,
-                        is_rms_norm=isinstance(self.norm2, RMSNorm),
+                        is_rms_norm=is_rms_norm2,
                     )
                 else:
                     # No norm2, just add residual

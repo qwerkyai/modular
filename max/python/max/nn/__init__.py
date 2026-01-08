@@ -34,9 +34,9 @@ from .float8_config import (
 from .identity import Identity
 from .layer import Layer, LayerList, Module, Shardable
 from .linear import (
-    GatedMLP,
     MLP,
     MLPV1,
+    GatedMLP,
     ColumnParallelLinear,
     DistributedGemmConfig,
     GPTQLinear,
@@ -75,11 +75,12 @@ from .transformer import (
     Transformer,
     TransformerBlock,
 )
+from .selective_scan import (selective_scan_fn, selective_state_update_fn, mamba_inner_fn, mamba_inner_ref)
 
 __all__ = [
-    "GatedMLP",
     "MLP",
     "MLPV1",
+    "GatedMLP",
     "Allreduce",
     "AttentionWithRope",
     "AttentionWithRopeAndLoRA",
@@ -142,4 +143,8 @@ __all__ = [
     "YarnRotaryEmbedding",
     "YarnScalingParams",
     "clamp",
+    "selective_scan_fn",
+    "selective_state_update_fn",
+    "mamba_inner_fn",
+    "mamba_inner_ref",
 ]

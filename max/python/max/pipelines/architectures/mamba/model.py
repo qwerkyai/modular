@@ -152,6 +152,7 @@ class MambaInputs(ModelInputs):
     data_parallel_splits: Tensor | Sequence[Sequence[int]] | None = None
     """Tensor containing the data parallel splits."""
 
+
     def __init__(
         self,
         tokens: Tensor,

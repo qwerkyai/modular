@@ -150,25 +150,26 @@ fn run_ssd_combined_gpu[
     var gamma_gpu = ctx.enqueue_create_buffer[dtype](dim)
     
     # Copy to GPU
-    ctx.memcpy_h2d(output_cpu_gpu, output_cpu_h, batch * dim * seqlen * size_of[dtype]())
-    ctx.memcpy_h2d(output_gpu_gpu, output_gpu_h, batch * dim * seqlen * size_of[dtype]())
-    ctx.memcpy_h2d(x_cpu_gpu, x_cpu_h, batch * dim * n_chunks * 2 * dstate * size_of[dtype]())
-    ctx.memcpy_h2d(x_gpu_gpu, x_gpu_h, batch * dim * n_chunks * 2 * dstate * size_of[dtype]())
-    ctx.memcpy_h2d(out_z_cpu_gpu, out_z_cpu_h, batch * dim * seqlen * size_of[dtype]())
-    ctx.memcpy_h2d(out_z_gpu_gpu, out_z_gpu_h, batch * dim * seqlen * size_of[dtype]())
-    ctx.memcpy_h2d(residual_gpu, residual_h, batch * dim * seqlen * size_of[dtype]())
-    ctx.memcpy_h2d(u_gpu, u_h, batch * dim * seqlen * size_of[dtype]())
-    ctx.memcpy_h2d(delta_gpu, delta_h, batch * dim * seqlen * size_of[dtype]())
-    ctx.memcpy_h2d(A_gpu, A_h, dim * dstate * size_of[dtype]())
-    ctx.memcpy_h2d(B_gpu, B_h, batch * n_groups * dstate * seqlen * size_of[dtype]())
-    ctx.memcpy_h2d(C_gpu, C_h, batch * n_groups * dstate * seqlen * size_of[dtype]())
-    if has_D:
-        ctx.memcpy_h2d(D_gpu, D_h, D_size * size_of[dtype]())
-    if has_z:
-        ctx.memcpy_h2d(z_gpu, z_h, z_size * size_of[dtype]())
-    if has_delta_bias:
-        ctx.memcpy_h2d(delta_bias_gpu, delta_bias_h, delta_bias_size * size_of[dtype]())
-    ctx.memcpy_h2d(gamma_gpu, gamma_h, dim * size_of[dtype]())
+    with ctx.push_context():
+        ctx.enqueue_copy[dtype](output_cpu_gpu, output_cpu_h)
+        ctx.enqueue_copy[dtype](output_gpu_gpu, output_gpu_h)
+        ctx.enqueue_copy[dtype](x_cpu_gpu, x_cpu_h)
+        ctx.enqueue_copy[dtype](x_gpu_gpu, x_gpu_h)
+        ctx.enqueue_copy[dtype](out_z_cpu_gpu, out_z_cpu_h)
+        ctx.enqueue_copy[dtype](out_z_gpu_gpu, out_z_gpu_h)
+        ctx.enqueue_copy[dtype](residual_gpu, residual_h)
+        ctx.enqueue_copy[dtype](u_gpu, u_h)
+        ctx.enqueue_copy[dtype](delta_gpu, delta_h)
+        ctx.enqueue_copy[dtype](A_gpu, A_h)
+        ctx.enqueue_copy[dtype](B_gpu, B_h)
+        ctx.enqueue_copy[dtype](C_gpu, C_h)
+        if has_D:
+            ctx.enqueue_copy[dtype](D_gpu, D_h)
+        if has_z:
+            ctx.enqueue_copy[dtype](z_gpu, z_h)
+        if has_delta_bias:
+            ctx.enqueue_copy[dtype](delta_bias_gpu, delta_bias_h)
+        ctx.enqueue_copy[dtype](gamma_gpu, gamma_h)
     
     # Create GPU LayoutTensors
     var output_cpu_lt = LayoutTensor[dtype, layout_3d, MutAnyOrigin](
@@ -439,11 +440,12 @@ fn run_ssd_combined_gpu[
         block_dim=(BLOCK_SIZE,),
     )
     
-    ctx.sync()
+    ctx.synchronize()
     
     # Copy results back
-    ctx.memcpy_d2h(output_cpu_h, output_cpu_gpu, batch * dim * seqlen * size_of[dtype]())
-    ctx.memcpy_d2h(output_gpu_h, output_gpu_gpu, batch * dim * seqlen * size_of[dtype]())
+    with ctx.push_context():
+        ctx.enqueue_copy[dtype](output_cpu_h, output_cpu_gpu)
+        ctx.enqueue_copy[dtype](output_gpu_h, output_gpu_gpu)
     
     # Compare results
     var flattened_size = batch * dim * seqlen
@@ -490,7 +492,7 @@ fn run_ssd_combined_gpu[
     _ = gamma_gpu^
 
 
-def main() raises:
+def main():
     var ctx = DeviceContext()
     
     # Test basic ssd_combined
