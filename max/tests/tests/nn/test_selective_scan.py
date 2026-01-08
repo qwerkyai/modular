@@ -416,8 +416,6 @@ class TestSelectiveScanFn:
             Tensor.from_numpy(D).to(session.devices[0]),
         ]
         
-        for i, inp in enumerate(inputs):
-        
         results = compiled_model.execute(*inputs)
         
         assert len(results) == 1
