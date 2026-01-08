@@ -20,9 +20,20 @@ from max.pipelines.lib import MAXModelConfig, PipelineConfig, SupportedEncoding
 from transformers import AutoConfig
 
 # Maps from Safetensor to MAX weight names.
+# Note: Replacements are applied in order, so order matters for overlapping patterns
 MAMBA_SAFETENSOR_MAPPING = {
     "backbone.": "",  # Removes the "backbone" prefix if present.
     "model.": "",  # Removes the "model" prefix.
+    # HuggingFace uses "embeddings" (plural), our model uses "embedding" (singular)
+    "embeddings.weight": "embedding.weight",
+    # HuggingFace uses "norm_f" for final norm, our model uses "norm"
+    "norm_f.weight": "norm.weight",
+    # Note: HuggingFace Mamba uses tied embeddings (no separate lm_head.weight in safetensor)
+    # Our model also uses tied embeddings via set_shared_weight(), so no mapping needed.
+    # HuggingFace uses "conv1d.weight" and "conv1d.bias" (dot notation)
+    # Our model uses "conv1d_weight" and "conv1d_bias" (underscore notation)
+    "conv1d.weight": "conv1d_weight",
+    "conv1d.bias": "conv1d_bias",
     # Mamba-specific weight name mappings
     # HuggingFace format: layers.{i}.mixer.A_log -> MAX format: layers.{i}.mixer.A_log
     # HuggingFace format: layers.{i}.mixer.D -> MAX format: layers.{i}.mixer.D
@@ -65,7 +76,21 @@ def convert_safetensor_state_dict(
         max_name = safetensor_name
         for before, after in MAMBA_SAFETENSOR_MAPPING.items():
             max_name = max_name.replace(before, after)
-        new_state_dict[max_name] = value.data()
+        
+        weight_data = value.data()
+        
+        # Handle conv1d weight shape conversion
+        # HuggingFace: [out_channels, 1, kernel_size] -> MAX: [out_channels, kernel_size]
+        if "conv1d_weight" in max_name:
+            shape = tuple(int(d) for d in weight_data.shape)
+            if len(shape) == 3 and shape[1] == 1:
+                # Squeeze the middle dimension (in_channels/groups = 1)
+                # Convert via DLPack protocol to numpy
+                arr = np.from_dlpack(weight_data)
+                arr = arr.reshape(shape[0], shape[2]).copy()  # copy to ensure contiguity
+                weight_data = WeightData.from_numpy(arr, max_name)
+        
+        new_state_dict[max_name] = weight_data
 
     model_config = pipeline_config.model_config
 

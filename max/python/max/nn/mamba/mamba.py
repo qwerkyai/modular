@@ -329,12 +329,14 @@ class MambaSSM(Module):
         # In MAX, we work with flattened tensors, so we project then reshape
         xz_flat = self.in_proj(x)  # (batch * seqlen, intermediate_size * 2)
         
-        # Reshape to (batch, 2 * intermediate_size, seqlen) for mamba_inner_fn
-        # This matches the reference format: (batch, dim, seqlen)
-        xz = ops.reshape(
+        # Reshape to (batch, seqlen, 2 * intermediate_size) first, then permute to (batch, 2 * intermediate_size, seqlen)
+        # This is critical: reshape alone doesn't reorder elements, we need reshape + permute
+        xz_temp = ops.reshape(
             xz_flat,
-            shape=[batch_size, self.intermediate_size * 2, seqlen],
+            shape=[batch_size, seqlen, self.intermediate_size * 2],
         )
+        # Permute to (batch, 2 * intermediate_size, seqlen) to match reference format
+        xz = ops.permute(xz_temp, [0, 2, 1])
         
         # Check if we should use fast path (mamba_inner_fn)
         # Reference: use_fast_path and causal_conv1d_fn is not None and inference_params is None
@@ -456,12 +458,11 @@ class MambaSSM(Module):
             A = ops.negate(ops.exp(A_log_cast))  # (intermediate_size, d_state)
             D = self.D.cast(self.dtype)
 
-            # delta_bias
-            if hasattr(self.dt_proj, 'bias') and self.dt_proj.bias is not None:
-                delta_bias = self.dt_proj.bias.cast(self.dtype)
-            else:
-                delta_bias = ops.constant(0.0, dtype=self.dtype, device=u.device)
-                delta_bias = ops.broadcast_to(delta_bias, shape=[self.intermediate_size])
+            # delta_bias - NOTE: Since self.dt_proj is a Linear layer that already includes bias,
+            # we should NOT pass delta_bias separately to the kernel (which would double-apply it).
+            # Pass a zero tensor to avoid affecting the computation.
+            delta_bias = ops.constant(0.0, dtype=self.dtype, device=u.device)
+            delta_bias = ops.broadcast_to(delta_bias, shape=[self.intermediate_size])  # All zeros
 
             # selective_scan_fwd outputs
             chunk_size = 2048
@@ -491,7 +492,9 @@ class MambaSSM(Module):
                 parameters={"delta_softplus": self.delta_softplus},
             )
 
-            ss_output = results[0].tensor  # (batch, intermediate_size, seqlen)
+            # Use out_z (results[2]) which is the gated output: output * silu(z)
+            # results[0] is the ungated output, results[1] is the checkpoint tensor
+            ss_output = results[2].tensor  # (batch, intermediate_size, seqlen)
 
             # Permute to (batch, seqlen, intermediate_size) then flatten for output projection
             # Reference: y = rearrange(y, "b d l -> b l d")

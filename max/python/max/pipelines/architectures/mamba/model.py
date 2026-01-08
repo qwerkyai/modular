@@ -152,6 +152,11 @@ class MambaInputs(ModelInputs):
     data_parallel_splits: Tensor | Sequence[Sequence[int]] | None = None
     """Tensor containing the data parallel splits."""
 
+    # For Mamba without SSM state caching, we need to track all tokens
+    # so we can reprocess the full sequence each step
+    accumulated_tokens: Tensor | None = None
+    """All tokens seen so far (prompt + generated). Used for reprocessing in step mode."""
+
 
     def __init__(
         self,
@@ -168,6 +173,7 @@ class MambaInputs(ModelInputs):
         lora_ids_kv: Tensor | None = None,
         lora_grouped_offsets_kv: Tensor | None = None,
         data_parallel_splits: Tensor | Sequence[Sequence[int]] | None = None,
+        accumulated_tokens: Tensor | None = None,
     ) -> None:
         """
         Args:
@@ -175,6 +181,7 @@ class MambaInputs(ModelInputs):
             input_row_offsets: Input row offsets (ragged tensors).
             signal_buffers: Device buffers used for synchronization in
                 communication collectives.
+            accumulated_tokens: All tokens seen so far for reprocessing.
         """
         self.tokens = tokens
         self.input_row_offsets = input_row_offsets
@@ -189,6 +196,7 @@ class MambaInputs(ModelInputs):
         self.lora_ids_kv = lora_ids_kv
         self.lora_grouped_offsets_kv = lora_grouped_offsets_kv
         self.data_parallel_splits = data_parallel_splits
+        self.accumulated_tokens = accumulated_tokens
 
 
 class MambaModelBase(PipelineModel[TextContext]):
@@ -376,6 +384,8 @@ class MambaModelBase(PipelineModel[TextContext]):
                 np.array([return_n_logits], dtype=np.int64)
             ),
             data_parallel_splits=data_parallel_splits,
+            # Store accumulated tokens for reprocessing in subsequent steps
+            accumulated_tokens=tokens,
         )
 
         # Map model names to LoRA graph inputs
@@ -410,15 +420,50 @@ class MambaModelBase(PipelineModel[TextContext]):
         prev_model_inputs: ModelInputs,
     ) -> MambaInputs:
         """Prepare the inputs for the next token in multistep execution.
-        This should avoid any device synchronization or copy operations.
+        
+        For Mamba models without SSM state caching, we need to reprocess
+        the entire sequence (prompt + all generated tokens) each step.
+        This is necessary because Mamba relies on sequential state that
+        is not persisted between calls without explicit state caching.
         """
         assert isinstance(prev_model_inputs, MambaInputs)
-        row_offsets_size = prev_model_inputs.input_row_offsets.shape[0]
-        next_row_offsets = self._input_row_offsets_prealloc[:row_offsets_size]
+        
+        # Concatenate new token(s) to accumulated tokens
+        # This ensures the model sees the full context each step
+        if prev_model_inputs.accumulated_tokens is not None:
+            # Get previous tokens as numpy, append new token, convert back
+            prev_tokens_np = prev_model_inputs.accumulated_tokens.to_numpy()
+            next_tokens_np = next_tokens.to_numpy()
+            accumulated_np = np.concatenate([prev_tokens_np, next_tokens_np])
+            accumulated_tokens = Tensor.from_numpy(accumulated_np).to(
+                self.devices[0]
+            )
+            logger.debug(
+                f"Mamba reprocessing: prev_tokens={prev_tokens_np.tolist()}, "
+                f"new_token={next_tokens_np.tolist()}, "
+                f"accumulated={accumulated_np.tolist()}"
+            )
+        else:
+            accumulated_tokens = next_tokens
+            logger.debug(f"Mamba first step: tokens={next_tokens.to_numpy().tolist()}")
+        
+        # Update row offsets for the accumulated sequence
+        # For batch_size=1: offsets = [0, accumulated_length]
+        batch_size = prev_model_inputs.input_row_offsets.shape[0] - 1
+        accumulated_length = accumulated_tokens.shape[0] // batch_size
+        
+        # Create row offsets for the accumulated sequence
+        # Assuming batch_size=1 for now (most common case)
+        row_offsets = np.array(
+            [i * accumulated_length for i in range(batch_size + 1)],
+            dtype=np.uint32,
+        )
+        input_row_offsets = Tensor.from_numpy(row_offsets).to(self.devices[0])
+        logger.debug(f"Mamba row_offsets: {row_offsets.tolist()}")
 
         return MambaInputs(
-            tokens=next_tokens,
-            input_row_offsets=next_row_offsets,
+            tokens=accumulated_tokens,
+            input_row_offsets=input_row_offsets,
             signal_buffers=self.signal_buffers,
             return_n_logits=prev_model_inputs.return_n_logits,
             lora_ids=prev_model_inputs.lora_ids,
@@ -430,6 +475,7 @@ class MambaModelBase(PipelineModel[TextContext]):
             lora_ids_kv=prev_model_inputs.lora_ids_kv,
             lora_grouped_offsets_kv=prev_model_inputs.lora_grouped_offsets_kv,
             data_parallel_splits=prev_model_inputs.data_parallel_splits,
+            accumulated_tokens=accumulated_tokens,
         )
 
     @classmethod
@@ -571,12 +617,28 @@ class MambaModelBase(PipelineModel[TextContext]):
                 self._lora_manager.init_weights(single_model, state_dict)
 
             # Load weights.
+            logger.info(f"Loading {len(state_dict)} weights into Mamba model")
+            
+            # Check for weight name mismatches
+            model_weights = set(single_model.state_dict().keys())
+            provided_weights = set(state_dict.keys())
+            missing = model_weights - provided_weights
+            extra = provided_weights - model_weights
+            # Log model weights containing 'output' or 'embedding'
+            emb_out_weights = [w for w in model_weights if 'output' in w or 'embedding' in w]
+            logger.info(f"Model embedding/output weights: {sorted(emb_out_weights)}")
+            if missing:
+                logger.info(f"Weights expected but not in state_dict (will use defaults): {sorted(missing)}")
+            if extra:
+                logger.warning(f"Extra weights (provided but not expected): {list(extra)[:5]}{'...' if len(extra) > 5 else ''}")
+            
             single_model.load_state_dict(
                 state_dict,
                 override_quantization_encoding=True,
                 weight_alignment=1,
                 strict=False,
             )
+            logger.info(f"Model state dict has {len(single_model.state_dict())} weights after loading")
             self.state_dict = single_model.state_dict()
 
             with Graph(

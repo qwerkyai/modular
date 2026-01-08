@@ -93,7 +93,7 @@ class Mamba(Module):
                 dt_init=config.time_step_init_scheme,
                 dt_scale=config.time_step_scale,
                 dt_init_floor=config.time_step_floor,
-                use_fast_path=True,  # Use fast path when available
+                use_fast_path=False,  # Disabled: fast path has bugs with multi-token sequences
                 layer_idx=i,  # Pass layer index for inference caching
             )
             layers.append(
@@ -103,7 +103,7 @@ class Mamba(Module):
                     mlp=None,  # TODO: Add MLP support if needed
                     norm=create_norm(),
                     norm2=None,
-                    fused_add_norm=config.fused_add_norm,
+                    fused_add_norm=False,  # Disabled for debugging - config.fused_add_norm,
                     residual_in_fp32=config.residual_in_fp32,
                 )
             )
@@ -160,6 +160,9 @@ class Mamba(Module):
         
         # Process through Mamba blocks
         # Block returns (hidden_states, residual), so we need to handle that
+        # Our Block returns (mixer_output, residual) where residual accumulates sums
+        # but hidden_states is just the mixer output. The residual add happens
+        # at the start of the next layer.
         residual = None
         for layer in self.layers:
             h, residual = layer(
@@ -167,6 +170,12 @@ class Mamba(Module):
                 residual=residual,
                 input_row_offsets=input_row_offsets,
             )
+        
+        # After all layers, h is the last mixer output and residual contains the
+        # accumulated sum. We need to add them before the final norm.
+        # This matches HuggingFace's MambaBlock which does: hidden_states = residual + hidden_states
+        if residual is not None:
+            h = h + residual
         
         # Apply final normalization
         h = self.norm(h)

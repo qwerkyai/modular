@@ -13,9 +13,21 @@
 """The mamba mechanism used within the model."""
 
 from .mamba import Block, MambaSSM
+from .ssm_state_cache import (
+    SSMStateCacheInputs,
+    SSMStateCacheParams,
+    SSMStateInputSymbols,
+    SSMStateValues,
+    create_ssm_state_params,
+)
 
 __all__ = [
     "Block",
     "MambaSSM",
+    "SSMStateCacheInputs",
+    "SSMStateCacheParams",
+    "SSMStateInputSymbols",
+    "SSMStateValues",
+    "create_ssm_state_params",
 ]
 
