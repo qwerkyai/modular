@@ -141,6 +141,9 @@ def causal_conv1d_update(
     Implemented using standard ops because the Mojo causal_conv1d_update
     kernel uses in-place mutation of conv_state (OutputTensor only),
     which is incompatible with the non-legacy functional graph model.
+    TODO: After the kernel op is updated to accept conv_state_in as input
+    (separate PR), switch to F.custom("causal_conv1d_update", ...) for
+    better step-phase performance.
 
     Args:
         x: Input tensor of shape (batch, channels, 1).
